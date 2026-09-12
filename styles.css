@@ -1,0 +1,37 @@
+.vl-progress-track {
+  height: 6px;
+  background: var(--background-modifier-border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 0.5em 0;
+}
+
+.vl-progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--interactive-accent);
+  transition: width 0.15s ease;
+}
+
+.vl-progress-status {
+  font-size: 0.85em;
+  opacity: 0.8;
+  word-break: break-all;
+}
+
+.vl-review-item {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 0.25em 0.75em 0.5em;
+  margin: 0.75em 0;
+}
+
+.vl-review-item h4 {
+  margin: 0.5em 0;
+  word-break: break-all;
+}
+
+.vl-hint {
+  font-size: 0.85em;
+  opacity: 0.75;
+}

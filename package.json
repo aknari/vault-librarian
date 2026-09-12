@@ -1,0 +1,15 @@
+{
+  "name": "vault-librarian",
+  "version": "0.1.3",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --external:obsidian --format=cjs --platform=browser --target=es2020 --outfile=../../.obsidian/plugins/vault-librarian/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "esbuild test/core.test.ts --bundle --platform=node --format=cjs --outfile=.test/core.test.cjs && esbuild test/models.test.ts --bundle --platform=node --format=cjs --outfile=.test/models.test.cjs && esbuild test/secrets.test.ts --bundle --platform=node --format=cjs --outfile=.test/secrets.test.cjs && node .test/secrets.test.cjs && node .test/core.test.cjs && node .test/models.test.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}
