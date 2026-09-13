@@ -57,7 +57,11 @@ export interface LibrarianSettings {
   mocTag: string;
   /** merge = keep existing tags and add the accepted ones; replace = set exactly. */
   tagMode: TagMode;
-  /** Bumped whenever the prompt changes, to invalidate cached proposals. */
+  /**
+   * Cache key for `proposals.json`, bumped whenever the prompt changes so the
+   * stored proposals are regenerated instead of blocking those notes. It is not
+   * a preference: the value in the code always wins at load time.
+   */
   promptVersion: string;
 }
 
@@ -81,5 +85,7 @@ export const DEFAULT_SETTINGS: Readonly<LibrarianSettings> = Object.freeze({
   mocFileName: '_MOC',
   mocTag: 'moc',
   tagMode: 'merge',
-  promptVersion: 'v1',
+  // v5: descriptions per facet and per value; "Obsidian" removed from the
+  // framing line; no automatic renewal of a pending proposal whose note changed.
+  promptVersion: 'v5',
 });

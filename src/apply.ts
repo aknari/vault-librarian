@@ -2,12 +2,16 @@ import { App, TFile } from 'obsidian';
 import type { LibrarianSettings } from './settings';
 import type { CatalogEntry } from './catalog';
 import { dedupe, getList, parseNote, serializeNote, setValue } from './markdown';
+import { MOC_END, MOC_START, mocPlan } from './moc';
 import { listAllFilesUnder, readText, writeFileSafe } from './vault-io';
 import { loadProposals, saveProposals, type ProposalsFile } from './propose';
 
 export const BACKUP_FOLDER = 'backups';
-export const MOC_START = '<!-- librarian:moc:start -->';
-export const MOC_END = '<!-- librarian:moc:end -->';
+
+// The plan and the markers live in a pure module so they can be unit-tested;
+// re-exported here so anything importing them from `apply` keeps working.
+export { MOC_END, MOC_START } from './moc';
+export type { MocPlanItem } from './moc';
 
 export interface BackupFile {
   createdAt: string;
@@ -101,26 +105,6 @@ export async function undoLastApply(
   return { restored, backupPath: last.path };
 }
 
-function mocBlock(
-  node: string,
-  titles: string[],
-  children: string[],
-  mocFileName: string,
-): string {
-  const lines: string[] = [MOC_START, '', '## Notes', ''];
-  lines.push(...[...titles].sort().map(t => `- [[${t}]]`));
-  if (titles.length === 0) lines.push('_No notes directly in this folder._');
-  if (children.length > 0) {
-    lines.push('', '## Subfolders', '');
-    for (const child of children.sort()) {
-      const name = child.split('/').pop() ?? child;
-      lines.push(`- [[${child}/${mocFileName}|${name}]]`);
-    }
-  }
-  lines.push('', MOC_END);
-  return lines.join('\n');
-}
-
 /**
  * Creates/updates one MOC per folder that has 2+ notes in its subtree.
  * Only the block between the markers is rewritten, so manual notes survive.
@@ -132,55 +116,29 @@ export async function generateMocs(
 ): Promise<string[]> {
   if (!settings.mocEnabled) return [];
 
-  const direct = new Map<string, string[]>();
-  for (const entry of entries) {
-    if (!entry.folder) continue;
-    direct.set(entry.folder, [...(direct.get(entry.folder) ?? []), entry.title]);
-  }
-
-  const nodes = new Set<string>();
-  for (const folder of direct.keys()) {
-    const parts = folder.split('/');
-    for (let i = 1; i <= parts.length; i++) nodes.add(parts.slice(0, i).join('/'));
-  }
-
   const written: string[] = [];
-  for (const node of [...nodes].sort()) {
-    const subtree = [...direct.entries()].filter(
-      ([folder]) => folder === node || folder.startsWith(`${node}/`),
-    );
-    const subtreeCount = subtree.reduce((sum, [, titles]) => sum + titles.length, 0);
-    if (subtreeCount < 2) continue;
-
-    const titles = direct.get(node) ?? [];
-    const children = new Set<string>();
-    for (const [folder] of subtree) {
-      if (folder === node) continue;
-      const first = folder.slice(node.length + 1).split('/')[0];
-      if (first) children.add(`${node}/${first}`);
-    }
-
-    const path = `${node}/${settings.mocFileName}.md`;
-    const existing = (await readText(app, path)) ?? '';
-    const block = mocBlock(node, titles, [...children], settings.mocFileName);
+  for (const item of mocPlan(entries, settings.mocFileName)) {
+    const existing = (await readText(app, item.path)) ?? '';
 
     let content: string;
     if (existing.includes(MOC_START) && existing.includes(MOC_END)) {
       content = existing.replace(
         new RegExp(`${escapeRe(MOC_START)}[\\s\\S]*?${escapeRe(MOC_END)}`),
-        block,
+        item.block,
       );
     } else {
-      const header = existing.trim() ? `${existing.replace(/\s*$/, '')}\n\n` : `# MOC — ${node}\n\n`;
-      content = `${header}${block}\n`;
+      const header = existing.trim()
+        ? `${existing.replace(/\s*$/, '')}\n\n`
+        : `# MOC — ${item.folder}\n\n`;
+      content = `${header}${item.block}\n`;
     }
 
     const note = parseNote(content);
     const tags = dedupe([...getList(note, 'tags'), settings.mocTag.trim()].filter(Boolean));
     if (tags.length > 0) setValue(note, 'tags', tags);
 
-    await writeFileSafe(app, path, serializeNote(note));
-    written.push(path);
+    await writeFileSafe(app, item.path, serializeNote(note));
+    written.push(item.path);
   }
   return written;
 }

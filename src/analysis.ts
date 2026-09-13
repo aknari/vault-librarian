@@ -18,6 +18,15 @@ export interface RawNote {
   path: string;
   content: string;
   mtime: number;
+  /**
+   * `link-source` notes are read for their links but never become catalogue
+   * entries: the `_MOC.md` files this plugin writes.
+   *
+   * Dropping them entirely made the audit blind to the links it had just
+   * created, so the orphan count could not move however many MOCs were
+   * generated — the report looked as if the step had done nothing.
+   */
+  role?: 'entry' | 'link-source';
 }
 
 export interface CatalogEntry {
@@ -58,8 +67,21 @@ export interface CatalogStats {
   /** Same breakages, grouped by the folder the broken links live in. */
   brokenByFolder: Array<{ folder: string; targets: number; notes: number }>;
   noiseLinks: Array<{ target: string; count: number }>;
+  /** Link targets that exist in a folder this scan skips. */
+  outsideLinks: Array<{ target: string; count: number }>;
+  /**
+   * Link targets whose file exists in a scanned folder but could not be read.
+   * Kept apart from both "broken" and "outside": the file is really there, and
+   * the reason it was skipped is worth a look.
+   */
+  unreadableLinks: Array<{ target: string; count: number }>;
   tagCounts: Array<{ tag: string; count: number }>;
   folders: Array<{ folder: string; notes: number; untagged: number; orphans: number }>;
+}
+
+/** Normalised key for a vault path, with any `.md` stripped. */
+function pathKey(path: string): string {
+  return titleKey(path.replace(/\.md$/i, ''));
 }
 
 const NOISE_LINK_RE =
@@ -70,44 +92,121 @@ function looksLikeNoise(target: string): boolean {
   return NOISE_LINK_RE.test(target.trim());
 }
 
-/** Builds the catalogue and its statistics from raw notes. */
-export function buildCatalog(notes: RawNote[]): { catalog: Catalog; stats: CatalogStats } {
-  const entries: CatalogEntry[] = notes.map(raw => {
-    const note = parseNote(raw.content);
-    const summaryValue = getValue(note, 'summary');
-    const summary =
-      typeof summaryValue === 'string' && summaryValue.trim()
-        ? summaryValue.trim()
-        : Array.isArray(summaryValue) && summaryValue.length > 0
-          ? summaryValue[0]
-          : null;
-    return {
-      path: raw.path,
-      title: basename(raw.path),
-      folder: raw.path.split('/').slice(0, -1).join('/'),
-      tags: dedupe([...tagsOf(note), ...inlineTags(note.body)]),
-      summary,
-      linksOut: wikilinks(note.body),
-      linksIn: 0,
-      headings: (note.body.match(/^#{1,6}\s/gm) ?? []).length,
-      words: note.body.trim() ? note.body.trim().split(/\s+/).length : 0,
-      size: raw.content.length,
-      mtime: raw.mtime,
-      hasFrontmatter: note.fence !== null,
-    };
-  });
+export interface UnscannedTitle {
+  title: string;
+  /**
+   * `excluded`: the title lives in a folder the settings skip.
+   * `unreadable`: the file is there but could not be read (a dangling symlink,
+   * most often) — a real problem in the vault, and not the same one as a link to
+   * a note that does not exist.
+   */
+  reason: 'excluded' | 'unreadable';
+}
 
-  // Resolve incoming links by note title (case- and Unicode-normalisation-insensitive).
+export interface BuildOptions {
+  /**
+   * Titles that exist in the vault but were not read by this scan.
+   *
+   * A link to one of them is not a *missing* target — Obsidian resolves it — so
+   * counting it as broken made that number impossible to bring to zero, which is
+   * how a report stops being read.
+   */
+  unscanned?: UnscannedTitle[];
+}
+
+/** Builds the catalogue and its statistics from raw notes. */
+export function buildCatalog(
+  notes: RawNote[],
+  options: BuildOptions = {},
+): { catalog: Catalog; stats: CatalogStats } {
+  // Parsed once for every note, including the link sources that are not
+  // entries: the MOCs have to contribute their links to the graph.
+  const parsed = notes.map(raw => ({ raw, note: parseNote(raw.content) }));
+
+  const entries: CatalogEntry[] = parsed
+    .filter(({ raw }) => raw.role !== 'link-source')
+    .map(({ raw, note }) => {
+      const summaryValue = getValue(note, 'summary');
+      const summary =
+        typeof summaryValue === 'string' && summaryValue.trim()
+          ? summaryValue.trim()
+          : Array.isArray(summaryValue) && summaryValue.length > 0
+            ? summaryValue[0]
+            : null;
+      return {
+        path: raw.path,
+        title: basename(raw.path),
+        folder: raw.path.split('/').slice(0, -1).join('/'),
+        tags: dedupe([...tagsOf(note), ...inlineTags(note.body)]),
+        summary,
+        linksOut: wikilinks(note.body),
+        linksIn: 0,
+        headings: (note.body.match(/^#{1,6}\s/gm) ?? []).length,
+        words: note.body.trim() ? note.body.trim().split(/\s+/).length : 0,
+        size: raw.content.length,
+        mtime: raw.mtime,
+        hasFrontmatter: note.fence !== null,
+      };
+    });
+
+  // Resolve incoming links (case- and Unicode-normalisation-insensitive).
   const byTitle = new Map<string, CatalogEntry>();
   for (const entry of entries) byTitle.set(titleKey(entry.title), entry);
+  const byPath = new Map<string, CatalogEntry>();
+  for (const entry of entries) byPath.set(pathKey(entry.path), entry);
 
+  // Anything that exists is a legitimate *target*, entries and link sources
+  // alike — the parent MOC links to the child MOCs. Not knowing that made every
+  // one of those links a "missing note", which is the opposite of true.
+  const known = new Set<string>();
+  for (const { raw } of parsed) {
+    known.add(titleKey(basename(raw.path)));
+    known.add(pathKey(raw.path));
+  }
+
+  /**
+   * A link addresses a note by full path or by title alone. The path is tried
+   * first, and only when the link carries one: two notes can share a title
+   * ("01-materias" does), and the path is exactly what tells them apart.
+   */
+  const resolveTarget = (target: string): CatalogEntry | undefined => {
+    if (target.includes('/')) {
+      const exact = byPath.get(pathKey(target));
+      if (exact) return exact;
+    }
+    return byTitle.get(titleKey(basename(target)));
+  };
+
+  const outside = new Set<string>();
+  const unreadable = new Set<string>();
+  for (const item of options.unscanned ?? []) {
+    const key = titleKey(item.title);
+    if (!key) continue;
+    (item.reason === 'excluded' ? outside : unreadable).add(key);
+  }
+  const outsideHits = new Map<string, number>();
+  const unreadableHits = new Map<string, number>();
   const broken = new Map<string, Set<string>>();
   const noise = new Map<string, number>();
-  for (const entry of entries) {
-    for (const target of entry.linksOut) {
-      const dest = byTitle.get(titleKey(basename(target)));
+  for (const { raw, note } of parsed) {
+    for (const target of wikilinks(note.body)) {
+      const key = titleKey(basename(target));
+      const dest = resolveTarget(target);
       if (dest) {
         dest.linksIn++;
+        continue;
+      }
+      // A file that exists but is not an entry: a link to it works, so there is
+      // nothing to report. Path first, for the same reason as above.
+      if (known.has(pathKey(target)) || known.has(key)) continue;
+      // Checked before the noise patterns: "a file with that name really
+      // exists" is stronger evidence than a filename that looks generated.
+      if (outside.has(key)) {
+        outsideHits.set(target, (outsideHits.get(target) ?? 0) + 1);
+        continue;
+      }
+      if (unreadable.has(key)) {
+        unreadableHits.set(target, (unreadableHits.get(target) ?? 0) + 1);
         continue;
       }
       if (looksLikeNoise(target)) {
@@ -115,7 +214,7 @@ export function buildCatalog(notes: RawNote[]): { catalog: Catalog; stats: Catal
         continue;
       }
       const sources = broken.get(target) ?? new Set<string>();
-      sources.add(entry.path);
+      sources.add(raw.path);
       broken.set(target, sources);
     }
   }
@@ -188,6 +287,12 @@ export function buildCatalog(notes: RawNote[]): { catalog: Catalog; stats: Catal
     noiseLinks: [...noise.entries()]
       .map(([target, count]) => ({ target, count }))
       .sort((a, b) => b.count - a.count),
+    outsideLinks: [...outsideHits.entries()]
+      .map(([target, count]) => ({ target, count }))
+      .sort((a, b) => b.count - a.count || a.target.localeCompare(b.target)),
+    unreadableLinks: [...unreadableHits.entries()]
+      .map(([target, count]) => ({ target, count }))
+      .sort((a, b) => b.count - a.count || a.target.localeCompare(b.target)),
     tagCounts: [...tagCounts.entries()]
       .map(([tag, count]) => ({ tag, count }))
       .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag)),
@@ -230,6 +335,8 @@ export function renderAudit(stats: CatalogStats, maxList = 40, maxBroken = 200, 
   lines.push(`| Without headings | ${stats.noHeadings.length} |`);
   lines.push(`| Duplicate titles | ${stats.duplicateTitles.length} |`);
   lines.push(`| Broken links (missing target) | ${stats.brokenLinks.length} |`);
+  lines.push(`| Links outside the scan | ${stats.outsideLinks.length} |`);
+  lines.push(`| Links to unreadable files | ${stats.unreadableLinks.length} |`);
   lines.push(`| Distinct tags | ${stats.tagCounts.length} |`);
   lines.push('');
 
@@ -303,6 +410,34 @@ export function renderAudit(stats: CatalogStats, maxList = 40, maxBroken = 200, 
     lines.push(`- …and ${stats.brokenLinks.length - maxBroken} more targets.`);
   }
   lines.push('');
+
+  if (stats.outsideLinks.length > 0) {
+    lines.push(`## Links to notes outside the scan (${stats.outsideLinks.length})`);
+    lines.push('');
+    lines.push(
+      'These targets exist in the vault, in a folder this scan skips. Obsidian '
+      + 'resolves them, so they are not broken links — only out of scope.',
+    );
+    lines.push('');
+    for (const { target, count } of stats.outsideLinks.slice(0, maxList)) {
+      lines.push(`- \`${target}\` — ${count}`);
+    }
+    lines.push('');
+  }
+
+  if (stats.unreadableLinks.length > 0) {
+    lines.push(`## Links to unreadable files (${stats.unreadableLinks.length})`);
+    lines.push('');
+    lines.push(
+      'The file is in the vault but the scan could not read it, so the link was '
+      + 'left out of this report. A dangling symlink is the usual cause.',
+    );
+    lines.push('');
+    for (const { target, count } of stats.unreadableLinks.slice(0, maxList)) {
+      lines.push(`- \`${target}\` — ${count}`);
+    }
+    lines.push('');
+  }
 
   if (stats.noiseLinks.length > 0) {
     lines.push(`## Template noise (${stats.noiseLinks.length})`);

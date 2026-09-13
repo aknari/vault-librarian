@@ -58,7 +58,14 @@ declare module "obsidian" {
 
   export class Plugin {
     app: App;
-    addCommand(command: { id: string; name: string; callback: () => void | Promise<void> }): void;
+    addCommand(command: {
+      id: string;
+      name: string;
+      /** Obsidian requires one of the two, hence both optional here. */
+      callback?: () => void | Promise<void>;
+      /** Returning false hides the command; it runs only when `checking` is false. */
+      checkCallback?: (checking: boolean) => boolean;
+    }): void;
     addSettingTab(tab: PluginSettingTab): void;
     addRibbonIcon(icon: string, title: string, callback: () => void | Promise<void>): HTMLElement;
     loadData(): Promise<unknown>;
@@ -115,6 +122,7 @@ declare module "obsidian" {
     setButtonText(text: string): this;
     setCta(): this;
     setTooltip(text: string): this;
+    setDisabled(disabled: boolean): this;
     onClick(cb: () => void | Promise<void>): this;
   }
 

@@ -1,6 +1,13 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
 import type VaultLibrarianPlugin from '../main';
-import { normalizeFacetName, normalizeValue, tidyVocabulary, tagCount } from '../vocabulary';
+import {
+  normalizeFacetName,
+  normalizeValue,
+  tagCount,
+  tidyVocabulary,
+  valueDescription,
+  type Facet,
+} from '../vocabulary';
 import { loadCatalog } from '../catalog';
 
 export class VocabularyModal extends Modal {
@@ -11,8 +18,13 @@ export class VocabularyModal extends Modal {
     super(app);
   }
 
-  onOpen(): void {
+  async onOpen(): Promise<void> {
     this.titleEl.setText('Vault Librarian — Tag vocabulary');
+    // Read from disk on every open. The in-memory copy is only loaded at plugin
+    // startup, so a vocabulary file edited while Obsidian was running would be
+    // invisible here — and saving from that stale, empty state would overwrite
+    // it with whatever this panel happened to show.
+    await this.plugin.loadVocabularyFile();
     this.render();
   }
 
@@ -49,6 +61,28 @@ export class VocabularyModal extends Modal {
             void this.save().then(() => this.render());
           }),
         );
+      // Descriptions are optional but they are the difference between "pick from
+      // this list" and "pick the one that matches": a model handed only the
+      // values reaches for the nearest-looking one.
+      new Setting(contentEl)
+        .setName('Meaning')
+        .setDesc(
+          'What this facet is for, in your words. It goes to the model as-is: a bare list of values '
+          + 'cannot say whether "materia" means the subjects you teach.',
+        )
+        .addText(text =>
+          text
+            .setPlaceholder('asignaturas que imparto')
+            .setValue(facet.description ?? '')
+            .onChange(value => {
+              const meaning = value.trim();
+              if (meaning) facet.description = meaning;
+              else delete facet.description;
+            }),
+        );
+      const descriptionsEl = contentEl.createDiv({ cls: 'vl-value-descriptions' });
+      let timer: number | undefined;
+      const refresh = (): void => this.renderValueDescriptions(descriptionsEl, facet);
       new Setting(contentEl)
         .setName('Values (one per line)')
         .addTextArea(area =>
@@ -60,8 +94,14 @@ export class VocabularyModal extends Modal {
                 .split('\n')
                 .map(normalizeValue)
                 .filter(Boolean);
+              // Rebuild the per-value boxes as the list is typed. Only this
+              // block is redrawn, so focus stays in the textarea and nothing
+              // typed in a description box is disturbed.
+              window.clearTimeout(timer);
+              timer = window.setTimeout(refresh, 400);
             }),
         );
+      refresh();
     });
 
     new Setting(contentEl)
@@ -151,7 +191,6 @@ export class VocabularyModal extends Modal {
       )
       .addButton(btn =>
         btn.setButtonText('Save & close').setCta().onClick(async () => {
-          this.plugin.vocabulary = tidyVocabulary(vocabulary);
           await this.save();
           new Notice(
             `Vault Librarian: vocabulary saved (${tagCount(this.plugin.vocabulary)} tags).`,
@@ -159,6 +198,40 @@ export class VocabularyModal extends Modal {
           this.close();
         }),
       );
+  }
+
+  /**
+   * One description box per value, rebuilt from whatever the value list holds.
+   *
+   * Needed where a single facet gathers unrelated things: `tema` can hold
+   * `i18n` (software) and `tamazight` (a language), and no facet-level
+   * description can tell those apart. A box for a value that is deleted with the
+   * textarea simply stops being drawn.
+   */
+  private renderValueDescriptions(parent: HTMLElement, facet: Facet): void {
+    parent.empty();
+    if (facet.values.length === 0) return;
+    parent.createEl('p', {
+      text:
+        'What each value means (optional). Use it where one facet gathers unrelated things: '
+        + '"i18n" (software) next to "tamazight" (a language) cannot be told apart from the facet alone.',
+      cls: 'vl-hint',
+    });
+    for (const value of facet.values) {
+      new Setting(parent)
+        .setName(value)
+        .addText(text =>
+          text
+            .setPlaceholder('what it means (optional)')
+            .setValue(valueDescription(facet, value))
+            .onChange(input => {
+              const meaning = input.trim();
+              const map = (facet.valueDescriptions ??= {});
+              if (meaning) map[value] = meaning;
+              else delete map[value];
+            }),
+        );
+    }
   }
 
   private async save(): Promise<void> {

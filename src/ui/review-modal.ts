@@ -7,6 +7,14 @@ const MAX_SHOWN = 60;
 
 export class ReviewModal extends Modal {
   private file: ProposalsFile | null = null;
+  /**
+   * Which of the collapsed sections the user had open.
+   *
+   * `render()` rebuilds the whole body, so without this every click inside a
+   * section would fold it shut again — and the sections are where the 30-odd
+   * already-decided proposals live.
+   */
+  private readonly openSections = new Set<string>();
 
   constructor(
     app: App,
@@ -17,6 +25,9 @@ export class ReviewModal extends Modal {
 
   async onOpen(): Promise<void> {
     this.titleEl.setText('Vault Librarian — Review proposals');
+    // The tags shown here are validated against the vocabulary, so read it from
+    // disk instead of trusting the copy loaded at startup.
+    await this.plugin.loadVocabularyFile();
     this.file = await this.plugin.getProposalsFile();
     this.render();
   }
@@ -38,10 +49,12 @@ export class ReviewModal extends Modal {
     const count = (status: Proposal['status']): number =>
       file.proposals.filter(p => p.status === status).length;
 
+    const outOfDate = file.proposals.filter(p => p.status === 'pending' && p.noteChanged).length;
     contentEl.createEl('p', {
       text:
         `Pending: ${count('pending')} · accepted: ${count('accepted')} · applied: ${count('applied')} · ` +
-        `rejected: ${count('rejected')} (of ${file.proposals.length}).`,
+        `rejected: ${count('rejected')} (of ${file.proposals.length}).` +
+        (outOfDate > 0 ? ` Out of date: ${outOfDate}.` : ''),
     });
     contentEl.createEl('p', {
       text: 'Nothing is written to your notes until you press "Apply accepted".',
@@ -101,12 +114,103 @@ export class ReviewModal extends Modal {
       contentEl.createEl('p', { text: 'No pending proposals. Run "Propose tags" when you want more.' });
     }
 
+    // The two decided statuses used to be counted in the header and nowhere
+    // else: an `accepted` proposal was invisible, so the only way to unblock its
+    // note was to edit proposals.json by hand — and the picker refuses both of
+    // these states, which left the note unreachable. Reopening puts a proposal
+    // back in the queue a forced run ("Choose notes") can visit.
+    const accepted = file.proposals.filter(p => p.status === 'accepted');
+    const applied = file.proposals.filter(p => p.status === 'applied');
+    if (accepted.length > 0 || applied.length > 0) {
+      const decided = contentEl.createDiv({ cls: 'vl-decided' });
+      decided.createEl('h4', { text: 'Already decided' });
+      decided.createEl('p', {
+        cls: 'vl-hint',
+        text:
+          'Not listed above, because a decision has been taken on them. "Back to pending" ' +
+          'returns one to the queue so "Choose notes" can pick it up again.',
+      });
+      if (accepted.length > 0) {
+        this.renderDecided(decided, 'Accepted, not applied yet', accepted, file);
+      }
+      if (applied.length > 0) {
+        this.renderDecided(decided, 'Applied to the note', applied, file);
+      }
+    }
+
     new Setting(contentEl).addButton(btn =>
       btn.setButtonText('Save & close').setCta().onClick(async () => {
         await this.plugin.saveProposalsFile(file);
         this.close();
       }),
     );
+  }
+
+  /**
+   * One collapsed section for a decided status, with the two ways back.
+   *
+   * `applied` needs the warning: the tags are in the note's frontmatter, and
+   * reopening a proposal does not take them out — it only lets the model be
+   * asked again, with the old tags still visible in the note it is shown. That
+   * is a limitation, not an accident, so the row says so instead of letting the
+   * user discover it in the note afterwards.
+   */
+  private renderDecided(
+    parent: HTMLElement,
+    title: string,
+    proposals: Proposal[],
+    file: ProposalsFile,
+  ): void {
+    // `createEl` is typed as HTMLElement by the project's shim; only the real
+    // tag knows about `open`.
+    const details = parent.createEl('details', { cls: 'vl-decided-section' }) as HTMLDetailsElement;
+    details.createEl('summary', { text: `${title} (${proposals.length})` });
+    details.open = this.openSections.has(title);
+    details.addEventListener('toggle', () => {
+      if (details.open) this.openSections.add(title);
+      else this.openSections.delete(title);
+    });
+
+    for (const proposal of proposals) {
+      const box = details.createDiv({ cls: 'vl-review-item vl-review-decided' });
+      const head = box.createDiv({ cls: 'vl-review-head' });
+      head.createEl('span', { text: proposal.path, cls: 'vl-review-path' });
+      head.createEl('span', {
+        text: proposal.status,
+        cls: `vl-state-chip vl-state-${proposal.status}`,
+      });
+      box.createEl('p', {
+        cls: 'vl-hint',
+        text:
+          proposal.tags.length > 0
+            ? proposal.tags.join(', ')
+            : 'no tags in this proposal — applying it would only write the summary',
+      });
+      if (proposal.status === 'applied') {
+        box.createEl('p', {
+          cls: 'vl-hint',
+          text:
+            'The tags are already written in the note: going back to pending unlocks the ' +
+            'proposal, it does not remove them. Use "Undo last apply" to restore the notes ' +
+            'of the last apply, content included.',
+        });
+      }
+
+      new Setting(box)
+        .addButton(btn =>
+          btn.setButtonText('Back to pending').onClick(async () => {
+            proposal.status = 'pending';
+            await this.plugin.saveProposalsFile(file);
+            this.render();
+          }),
+        )
+        .addButton(btn =>
+          btn.setButtonText('Reject').onClick(async () => {
+            proposal.status = 'rejected';
+            await this.plugin.saveProposalsFile(file);
+            this.render();
+          }),
+        );    }
   }
 
   private renderProposal(
@@ -116,6 +220,18 @@ export class ReviewModal extends Modal {
   ): void {
     const box = parent.createDiv({ cls: 'vl-review-item' });
     box.createEl('h4', { text: proposal.path });
+
+    // A flag, not a silent re-ask: the usual reason a note changes on its own is
+    // a plugin rewriting its frontmatter on open, and replacing the proposal
+    // automatically would throw away whatever was edited here.
+    if (proposal.noteChanged) {
+      box.createEl('p', {
+        cls: 'vl-hint',
+        text:
+          'The note changed after this proposal was written, so it may be out of date. '
+          + 'Nothing is re-asked automatically — press Re-propose to ask again.',
+      });
+    }
 
     new Setting(box)
       .setName('Summary')
@@ -161,6 +277,24 @@ export class ReviewModal extends Modal {
           await this.plugin.saveProposalsFile(file);
           this.render();
         }),
-      );
+      )
+      // Offered for everything but an applied proposal, whose tags are already
+      // in the note: there the model cannot be asked again without an undo.
+      .addButton(btn => {
+        if (proposal.status === 'applied') return;
+        btn.setButtonText('Re-propose').onClick(async () => {
+          btn.setDisabled(true);
+          // Save first: the edits made in this panel live in memory only, and
+          // the run reads the proposals file from disk.
+          await this.plugin.saveProposalsFile(file);
+          const fresh = await this.plugin.reproposeNote(proposal.path);
+          if (fresh) {
+            this.file = fresh;
+            this.render();
+          } else {
+            btn.setDisabled(false);
+          }
+        });
+      });
   }
 }

@@ -274,27 +274,6 @@ export class LibrarianSettingsTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
-    new Setting(containerEl)
-      .setName('Max notes per run')
-      .setDesc('How many notes a single "Propose tags" run may process (keeps you inside rate limits).')
-      .addText(text =>
-        text.setValue(String(s.maxNotesPerRun)).onChange(async value => {
-          const n = Number.parseInt(value, 10);
-          s.maxNotesPerRun = Number.isFinite(n) && n > 0 ? Math.min(n, 500) : 25;
-          await this.plugin.saveSettings();
-        }),
-      );
-    new Setting(containerEl)
-      .setName('Max characters per note')
-      .setDesc('Characters of each note sent to the model (0 = whole note).')
-      .addText(text =>
-        text.setValue(String(s.maxContextChars)).onChange(async value => {
-          const n = Number.parseInt(value, 10);
-          s.maxContextChars = Number.isFinite(n) && n >= 0 ? n : 4000;
-          await this.plugin.saveSettings();
-        }),
-      );
-
     new Setting(containerEl).setName('Tags and MOCs').setHeading();
     new Setting(containerEl)
       .setName('When applying tags')
@@ -343,14 +322,65 @@ export class LibrarianSettingsTab extends PluginSettingTab {
           }),
         );
     };
-    action('Scan vault', 'Builds the catalogue and writes the audit report. No LLM, no cost.', 'Scan', () =>
-      this.plugin.runScan(),
+    action(
+      'Scan vault',
+      'Builds the catalogue and writes the audit report. No LLM, no cost. The batch size does not apply: it always reads every note.',
+      'Scan',
+      () => this.plugin.runScan(),
     );
     action('Tag vocabulary', 'The authority for tags: facets and values, editable.', 'Edit vocabulary', () =>
       this.plugin.openVocabulary(),
     );
-    action('Propose tags', 'Asks the model for summary, tags and related notes. Nothing is written yet.', 'Propose', () =>
-      this.plugin.runPropose(),
+
+    // The two numbers that govern a run sit next to the button they govern,
+    // with the size of the batch spelled out: they used to live above, where
+    // nothing said which action they applied to.
+    new Setting(containerEl).setName('Batch size').setHeading();
+    containerEl.createEl('p', {
+      cls: 'vl-hint',
+      text:
+        `A run proposes for ${s.maxNotesPerRun} note(s) at a time, sending up to ` +
+        `${s.maxContextChars || 'all'} character(s) of each. Only the runs below that ask the model ` +
+        'are affected.',
+    });
+    new Setting(containerEl)
+      .setName('Notes per run')
+      .setDesc(
+        'How many notes a "Propose tags" run may process in one go (keeps you inside rate ' +
+        'limits). A hand-picked selection ignores this: there the selection is the batch.',
+      )
+      .addText(text =>
+        text.setValue(String(s.maxNotesPerRun)).onChange(async value => {
+          const n = Number.parseInt(value, 10);
+          s.maxNotesPerRun = Number.isFinite(n) && n > 0 ? Math.min(n, 500) : 25;
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+      );
+    new Setting(containerEl)
+      .setName('Characters per note')
+      .setDesc('How much of each note is sent to the model (0 = the whole note).')
+      .addText(text =>
+        text.setValue(String(s.maxContextChars)).onChange(async value => {
+          const n = Number.parseInt(value, 10);
+          s.maxContextChars = Number.isFinite(n) && n >= 0 ? n : 4000;
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+      );
+
+    new Setting(containerEl).setName('Run the model').setHeading();
+    action(
+      'Propose tags',
+      'Asks the model for a summary, tags and related notes for the next notes in line. Nothing is written yet.',
+      'Propose',
+      () => this.plugin.runPropose(),
+    );
+    action(
+      'Propose, choosing the notes',
+      'Pick the exact notes you want worked on. The selection is the whole batch.',
+      'Choose notes',
+      () => this.plugin.openSelectNotes(),
     );
     action('Review proposals', 'Accept, edit or reject each proposal.', 'Review', () =>
       this.plugin.openReview(),

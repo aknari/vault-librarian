@@ -21,12 +21,28 @@ import {
   normalizeTag,
   normalizeValue,
   parseVocabulary,
+  resolveTag,
   tagFor,
   tidyVocabulary,
   validateTags,
   vocabularyPrompt,
+  type Vocabulary,
 } from '../src/vocabulary';
-import { buildCatalog, renderAudit, type RawNote } from '../src/analysis';
+import { mocPlan } from '../src/moc';
+import { buildCatalog, renderAudit, type CatalogEntry, type RawNote } from '../src/analysis';
+import {
+  PICKER_STATE_LABEL,
+  TAG_LIMITS,
+  TAG_SUPPORT_RULES,
+  TAG_TASK_LINE,
+  isNoteChanged,
+  pickerRow,
+  shouldPropose,
+  vocabularySuggestionPrompt,
+  withoutSelf,
+  type PickerState,
+  type Proposal,
+} from '../src/proposals';
 import {
   diceCoefficient,
   levenshtein,
@@ -197,9 +213,152 @@ check('vocabulary: parseVocabulary survives garbage', () => {
   ]);
 });
 
-check('vocabulary: prompt lists facets', () => {
+check('vocabulary: prompt spells every tag out in full', () => {
   const text = vocabularyPrompt({ facets: [{ name: 'tipo', values: ['moc', 'nota'] }] });
-  assert.equal(text, '- tipo: moc, nota');
+  // A compact listing ('- tipo: moc, nota') reads as if 'tipo: moc' were the
+  // tag, and models then answer exactly that, which no lookup can match.
+  assert.equal(text, '- tipo: tipo/moc, tipo/nota');
+});
+
+check('proposals: the vocabulary prompt names no language of its own', () => {
+  const text = vocabularySuggestionPrompt([{ tag: 'amawal', count: 4 }], 'v4');
+  // It used to say "Spanish here if they are Spanish" and to show Spanish facet
+  // names and real tags as the example. Both steered every other user — and the
+  // facet names it returns are written into the notes as `facet/value`.
+  for (const banned of ['Spanish', 'español', 'English', 'proyecto', 'lisa']) {
+    assert.ok(!text.includes(banned), `the prompt must not name a language: ${banned}`);
+  }
+  assert.ok(text.includes('the language the tags below are written in'));
+  assert.ok(text.includes('amawal (4)'), 'the listing still carries the tags themselves');
+});
+
+check('proposals: the prompt asks for no minimum number of tags', () => {
+  // A floor of three made models pad every short note to reach the quota: the
+  // same invented tag (`tema/obsidian`) came out of two different models on a
+  // note that never mentions Obsidian. Both halves must hold — a free count and
+  // the rule that says a short list is fine — or the padding comes back.
+  assert.equal(TAG_LIMITS.min, 1);
+  assert.ok(TAG_TASK_LINE.includes(`1 to ${TAG_LIMITS.max} tags`));
+  assert.ok(!/between \d+ and \d+ tags/.test(TAG_TASK_LINE));
+  assert.ok(TAG_SUPPORT_RULES.some(r => r.includes('supported by what the note')));
+  assert.ok(TAG_SUPPORT_RULES.some(r => r.includes('Never pad the list')));
+});
+
+check('vocabulary: resolveTag repairs the shapes models send', () => {
+  const v = {
+    facets: [
+      { name: 'proyecto', values: ['lisa'] },
+      { name: 'materia', values: ['sistemas-digitales'] },
+      { name: 'tipo', values: ['referencia'] },
+    ],
+  };
+  const cases: Array<[string, string]> = [
+    ['proyecto/lisa', 'proyecto/lisa'],
+    ['proyecto: lisa', 'proyecto/lisa'],
+    ['materia: -sistemas-digitales', 'materia/sistemas-digitales'],
+    ['- tipo: referencia', 'tipo/referencia'],
+    ['#proyecto/lisa', 'proyecto/lisa'],
+    ['sistemas-digitales', 'materia/sistemas-digitales'],
+  ];
+  for (const [raw, expected] of cases) assert.equal(resolveTag(raw, v), expected, raw);
+  assert.deepEqual(validateTags(v, ['proyecto: lisa', 'sistemas-digitales']), {
+    valid: ['proyecto/lisa', 'materia/sistemas-digitales'],
+    unknown: [],
+  });
+});
+
+check('vocabulary: an ambiguous bare value is never guessed', () => {
+  const v = {
+    facets: [
+      { name: 'proyecto', values: ['amawal'] },
+      { name: 'tema', values: ['amawal'] },
+    ],
+  };
+  assert.equal(resolveTag('amawal', v), '');
+  assert.deepEqual(validateTags(v, ['amawal']), { valid: [], unknown: ['amawal'] });
+  assert.equal(resolveTag('inventada', v), '');
+});
+
+// -------------------------------------------------------------- proposals
+
+function entryAt(mtime: number): CatalogEntry {
+  return { path: 'nota.md', mtime } as CatalogEntry;
+}
+
+function pendingProposal(mtime: number): Proposal {
+  return {
+    path: 'nota.md',
+    mtime,
+    summary: '',
+    tags: [],
+    related: [],
+    unknown: [],
+    status: 'pending',
+  };
+}
+
+check('proposals: a decision already taken is never revisited', () => {
+  for (const status of ['accepted', 'applied', 'rejected'] as const) {
+    const decided = { ...pendingProposal(1), status };
+    assert.equal(shouldPropose(decided, false), false, status);
+    assert.equal(shouldPropose(decided, true), false, `${status} (stale)`);
+  }
+});
+
+check('proposals: forcing re-asks one note but never discards work already done', () => {
+  // The user asking again on purpose is the only way to get a second opinion
+  // without editing the note, whose mtime is the signal the cache reads.
+  const offer = pendingProposal(1);
+  assert.equal(shouldPropose(offer, false, true), true, 'pending, note untouched');
+  assert.equal(shouldPropose(offer, false, true), true, 'pending, note changed');
+  // A rejected note must be revisitable on purpose: without this, one click in
+  // the review panel would take it out of the system for good.
+  const rejected = { ...offer, status: 'rejected' as const };
+  assert.equal(shouldPropose(rejected, false, true), true);
+  // These two hold work: `accepted` is reviewed but not applied yet, `applied`
+  // is already written into the note.
+  assert.equal(shouldPropose({ ...offer, status: 'accepted' as const }, false, true), false);
+  assert.equal(shouldPropose({ ...offer, status: 'applied' as const }, false, true), false);
+  // And forcing changes nothing for a note with no proposal at all.
+  assert.equal(shouldPropose(undefined, false, true), true);
+  // The normal run keeps its old rules: forcing is strictly an addition.
+  assert.equal(shouldPropose(offer, false), false);
+});
+
+check('proposals: a note is never related to itself', () => {
+  // Accents, ordinals and punctuation are irrelevant when matching titles.
+  assert.deepEqual(
+    withoutSelf(
+      ['Varios', '20-internacionalización de plasmoids', 'Notas sobre Lisa'],
+      '20-Internacionalizacion de Plasmoids',
+    ),
+    ['Varios', 'Notas sobre Lisa'],
+  );
+  assert.deepEqual(withoutSelf(['a', 'b', 'c', 'd', 'e', 'f'], 'otra'), ['a', 'b', 'c', 'd', 'e']);
+});
+
+check('proposals: pending is revisited when the prompt or the model changed', () => {
+  const offer = pendingProposal(1);
+  assert.equal(shouldPropose(undefined, false), true);
+  assert.equal(shouldPropose(offer, false), false);
+  // A batch that produced nothing usable must not block those notes for ever.
+  assert.equal(shouldPropose(offer, true), true);
+});
+
+check('proposals: a note that changed on its own is flagged, never re-asked', () => {
+  const offer = pendingProposal(1);
+  assert.equal(isNoteChanged(offer, entryAt(1)), false);
+  assert.equal(isNoteChanged(offer, entryAt(2)), true);
+  // This used to be `shouldPropose(offer, entryAt(2), false) === true`, i.e. the
+  // model was asked again and its answer *replaced* the pending proposal, so
+  // whatever you had edited in the review panel was lost. A frontmatter
+  // timestamp plugin moves a note's mtime just by opening it.
+  assert.equal(shouldPropose(offer, false), false, 'the note moving alone is not a reason to re-ask');
+  // A decided proposal is never flagged: its mtime moved because apply wrote
+  // the accepted tags into the note.
+  for (const status of ['accepted', 'applied', 'rejected'] as const) {
+    assert.equal(isNoteChanged({ ...offer, status }, entryAt(2)), false, status);
+  }
 });
 
 // --------------------------------------------------------------- analysis
@@ -333,6 +492,228 @@ check('catalog: report renders the headline numbers', () => {
   assert.ok(report.includes('| Notes analysed | 1 |'));
   assert.ok(report.includes('| Without any tag | 1 (100%) |'));
   assert.ok(report.includes('## Untagged notes (1)'));
+});
+
+// ------------------------------------------------------------ vocabulary meaning
+
+check('vocabulary: descriptions tell the model what a value means', () => {
+  const vocabulary: Vocabulary = {
+    facets: [
+      { name: 'materia', description: 'asignaturas que imparto', values: ['sistemas-digitales'] },
+      {
+        name: 'tema',
+        values: ['i18n', 'tamazight'],
+        valueDescriptions: { i18n: 'internacionalizacion de software' },
+      },
+    ],
+  };
+  const prompt = vocabularyPrompt(vocabulary);
+  assert.ok(prompt.includes('- materia — asignaturas que imparto: materia/sistemas-digitales'));
+  // The value description is what separates `i18n` from `tamazight`.
+  assert.ok(prompt.includes('tema/i18n (internacionalizacion de software)'));
+  // A value with no description is still spelled out in full.
+  assert.ok(prompt.includes('tema/tamazight'));
+  assert.ok(!prompt.includes('tamazight ('));
+});
+
+check('vocabulary: descriptions survive a round trip and leave no orphans', () => {
+  const parsed = parseVocabulary({
+    facets: [
+      {
+        name: 'tema',
+        description: 'tecnologias y asuntos',
+        values: ['i18n', 'plasma'],
+        valueDescriptions: { i18n: 'software', plasma: 'KDE Plasma', fantasma: 'ya no existe' },
+      },
+    ],
+  });
+  assert.equal(parsed.facets[0].description, 'tecnologias y asuntos');
+  assert.equal(parsed.facets[0].valueDescriptions?.plasma, 'KDE Plasma');
+  // `fantasma` describes a value that is not in the list; tidying drops it,
+  // instead of leaving it to attach itself to a value that looks like it later.
+  const tidy = tidyVocabulary(parsed);
+  assert.deepEqual(tidy.facets[0].valueDescriptions, { i18n: 'software', plasma: 'KDE Plasma' });
+  // And a vocabulary with no descriptions at all is unchanged by all this.
+  const plain = tidyVocabulary({ facets: [{ name: 'tipo', values: ['log'] }] });
+  assert.equal(plain.facets[0].valueDescriptions, undefined);
+});
+
+check('proposals: every picker state has a label, and no row is silently refused', () => {
+  // The picker draws the label next to the note; an unnamed state would render
+  // an empty chip, which is how the two refused rows went unnoticed before.
+  const states: PickerState[] = ['new', 'pending', 'out-of-date', 'rejected', 'accepted', 'applied'];
+  for (const state of states) assert.ok(PICKER_STATE_LABEL[state]?.length > 0, state);
+  for (const status of ['accepted', 'applied'] as const) {
+    const row = pickerRow({ ...pendingProposal(1), status }, false);
+    assert.equal(row.selectable, false, status);
+    assert.ok(row.note.length > 0, `${status} still says why it cannot be ticked`);
+  }
+});
+
+check('proposals: the picker can be told to allow a decided note, but only there', () => {
+  for (const status of ['accepted', 'applied'] as const) {
+    const decided = { ...pendingProposal(1), status };
+    // The override is what makes them reachable again, and it is passed in by
+    // the picker rather than inferred. A batch run never replaces a decision.
+    assert.equal(pickerRow(decided, false, true).selectable, true, status);
+    assert.equal(shouldPropose(decided, false, true, true), true, status);
+    assert.equal(shouldPropose(decided, false, true, false), false, status);
+    assert.equal(shouldPropose(decided, false, false, true), false, `${status} in a batch`);
+  }
+
+  // The reason sits on one line next to the note: a whole sentence per row is
+  // what made every row a different width.
+  const rows = [
+    pickerRow(undefined, false),
+    pickerRow(pendingProposal(1), false),
+    pickerRow(pendingProposal(1), true),
+    pickerRow({ ...pendingProposal(1), status: 'rejected' }, false),
+    pickerRow({ ...pendingProposal(1), status: 'accepted' }, false),
+    pickerRow({ ...pendingProposal(1), status: 'applied' }, false),
+  ];
+  for (const row of rows) {
+    assert.ok(row.note.length <= 45, `"${row.note}" is short enough for one line`);
+    assert.ok(!row.note.includes('\n'), 'and is a single line');
+  }
+});
+
+check('proposals: the picker offers exactly what a forced run would accept', () => {
+  assert.deepEqual(pickerRow(undefined, false), {
+    state: 'new',
+    selectable: true,
+    note: 'no proposal yet',
+  });
+  assert.equal(pickerRow(pendingProposal(1), false).state, 'pending');
+  const changed = pickerRow(pendingProposal(1), true);
+  assert.equal(changed.state, 'out-of-date');
+  assert.equal(changed.selectable, true);
+  assert.equal(pickerRow({ ...pendingProposal(1), status: 'rejected' }, false).selectable, true);
+  // These two hold work already done, so a tick must not turn into a no-op.
+  for (const status of ['accepted', 'applied'] as const) {
+    const row = pickerRow({ ...pendingProposal(1), status }, false);
+    assert.equal(row.selectable, false, status);
+    assert.ok(row.note.length > 0, `${status} says why it cannot be chosen`);
+  }
+});
+
+// -------------------------------------------------------------------- mocs
+
+function mocEntry(path: string): CatalogEntry {
+  const parts = path.split('/');
+  const title = (parts.pop() ?? '').replace(/\.md$/, '');
+  return { path, title, folder: parts.join('/') } as CatalogEntry;
+}
+
+check('moc: one-note folders are listed in the parent, not linked as a MOC that never exists', () => {
+  const plan = mocPlan(
+    [
+      mocEntry('00-src/30-dev/30-lisa/uno.md'),
+      mocEntry('00-src/30-dev/30-lisa/dos.md'),
+      mocEntry('00-src/30-dev/10-misc/solo.md'),
+    ],
+    '_MOC',
+  );
+  const byFolder = new Map(plan.map(item => [item.folder, item]));
+  // 10-misc holds a single note, so no MOC is written for it...
+  assert.equal(byFolder.has('00-src/30-dev/10-misc'), false);
+  const parent = byFolder.get('00-src/30-dev');
+  assert.ok(parent, 'the parent still gets one');
+  // ...so the parent must not point at it...
+  assert.ok(!parent.block.includes('10-misc/_MOC'), 'no link to a MOC that is never created');
+  // ...but its note has to stay reachable all the same.
+  assert.ok(parent.block.includes('[[00-src/30-dev/10-misc/solo|solo]]'));
+  // A folder that qualifies is still linked as a MOC, and lists its own notes.
+  assert.ok(parent.block.includes('[[00-src/30-dev/30-lisa/_MOC|30-lisa]]'));
+  const lisa = byFolder.get('00-src/30-dev/30-lisa');
+  // Notes are linked path-first, so a bare title can never pick the wrong note.
+  assert.ok(lisa?.block.includes('- [[00-src/30-dev/30-lisa/uno|uno]]'));
+  assert.ok(lisa?.block.includes('- [[00-src/30-dev/30-lisa/dos|dos]]'));
+});
+
+check('moc: every note ends up reachable, and every MOC link points at a MOC that is written', () => {
+  const entries = [mocEntry('a/x.md'), mocEntry('a/b/y.md'), mocEntry('a/b/c/z.md')];
+  const plan = mocPlan(entries, '_MOC');
+  const text = plan.map(item => item.block).join('\n');
+  for (const entry of entries) {
+    assert.ok(
+      text.includes(`[[${entry.folder}/${entry.title}|`),
+      `${entry.path} is linked from somewhere`,
+    );
+  }
+  for (const item of plan) {
+    for (const match of item.block.matchAll(/\[\[([^\]|]+)/g)) {
+      if (!match[1].endsWith('_MOC')) continue;
+      assert.ok(plan.some(p => p.path === `${match[1]}.md`), `${match[1]} is written`);
+    }
+  }
+});
+
+// --------------------------------------------------- links outside the scan
+
+check('catalog: a link the scan could not read is not called a missing target', () => {
+  const { stats } = buildCatalog(
+    [note('00-src/a.md', 'ver [[2024-02-27]], [[comments]] y [[no existe]]\n')],
+    {
+      unscanned: [
+        { title: '2024-02-27', reason: 'excluded' },
+        { title: 'comments', reason: 'unreadable' },
+      ],
+    },
+  );
+  // Only the target that really does not exist anywhere is left as broken.
+  assert.deepEqual(stats.brokenLinks.map(b => b.target), ['no existe']);
+  assert.deepEqual(stats.outsideLinks, [{ target: '2024-02-27', count: 1 }]);
+  assert.deepEqual(stats.unreadableLinks, [{ target: 'comments', count: 1 }]);
+  const report = renderAudit(stats);
+  assert.ok(report.includes('| Links outside the scan | 1 |'));
+  assert.ok(report.includes('| Links to unreadable files | 1 |'));
+  assert.ok(report.includes('## Links to notes outside the scan (1)'));
+  assert.ok(report.includes('## Links to unreadable files (1)'));
+});
+
+check('catalog: a MOC is a link source, not a note to catalogue', () => {
+  const { catalog, stats } = buildCatalog([
+    note('00-src/sola.md', 'sin enlaces\n'),
+    { path: '00-src/_MOC.md', content: '- [[sola]]\n', mtime: 1000, role: 'link-source' },
+  ]);
+  // The MOC is not audited...
+  assert.deepEqual(catalog.entries.map(e => e.path), ['00-src/sola.md']);
+  assert.equal(stats.total, 1);
+  // ...but its link still counts, which is what had the orphan figure frozen.
+  assert.equal(catalog.entries[0].linksIn, 1);
+  assert.deepEqual(stats.orphans, []);
+});
+
+check('catalog: a link to a MOC is a working link, not a missing note', () => {
+  const { stats } = buildCatalog([
+    note('00-src/30-dev/uno.md', '[[00-src/30-dev/_MOC|30-dev]]\n'),
+    note('00-src/30-dev/dos.md', '# dos\n'),
+    { path: '00-src/30-dev/_MOC.md', content: '- [[uno]]\n- [[dos]]\n', mtime: 1, role: 'link-source' },
+  ]);
+  // The MOC is not an entry, so a link to it resolved against nothing and was
+  // reported as broken — in every MOC, one per subfolder.
+  assert.deepEqual(stats.brokenLinks, []);
+  assert.deepEqual(stats.orphans, []);
+});
+
+check('catalog: a path-qualified link picks the right note of two with the same title', () => {
+  const { catalog, stats } = buildCatalog([
+    note('00-src/uno/01-materias.md', '# uno\n'),
+    note('00-src/dos/01-materias.md', '# dos\n'),
+  ]);
+  // By title alone the two collapse onto each other, so one of them always
+  // looked like an orphan; the paths tell them apart.
+  assert.equal(stats.duplicateTitles.length, 1);
+  assert.deepEqual(stats.orphans, ['00-src/uno/01-materias.md', '00-src/dos/01-materias.md']);
+  const linked = buildCatalog([
+    note('00-src/uno/01-materias.md', '# uno\n'),
+    note('00-src/dos/01-materias.md', '# dos\n'),
+    { path: '00-src/_MOC.md', content: '- [[00-src/uno/01-materias|01-materias]]\n', mtime: 1, role: 'link-source' },
+  ]);
+  const uno = linked.catalog.entries.find(e => e.path === '00-src/uno/01-materias.md');
+  const dos = linked.catalog.entries.find(e => e.path === '00-src/dos/01-materias.md');
+  assert.equal(uno?.linksIn, 1, 'the named one is the one that gets the link');
+  assert.equal(dos?.linksIn, 0);
 });
 
 console.log('');

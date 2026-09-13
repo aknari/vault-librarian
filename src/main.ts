@@ -16,6 +16,7 @@ import { LibrarianSettingsTab } from './ui/settings-tab';
 import { ProgressModal } from './ui/progress';
 import { ReviewModal } from './ui/review-modal';
 import { VocabularyModal } from './ui/vocabulary-modal';
+import { SelectNotesModal } from './ui/select-notes-modal';
 
 const VOCABULARY_FILE = 'vocabulary.json';
 
@@ -48,9 +49,25 @@ export default class VaultLibrarianPlugin extends Plugin {
       callback: () => void this.runPropose(),
     });
     this.addCommand({
+      id: 'propose-selected-notes',
+      name: 'Propose tags for selected notes (choose them)',
+      callback: () => this.openSelectNotes(),
+    });
+    this.addCommand({
       id: 'review-proposals',
       name: 'Review proposals',
       callback: () => void this.openReview(),
+    });
+    this.addCommand({
+      id: 'repropose-current-note',
+      name: 'Re-propose tags for the current note (ignore the cache)',
+      // Hidden when no note is open, instead of offering an action that can
+      // only answer "no note is open".
+      checkCallback: checking => {
+        if (!this.app.workspace.getActiveFile()) return false;
+        if (!checking) void this.reproposeCurrentNote();
+        return true;
+      },
     });
     this.addCommand({
       id: 'apply-accepted',
@@ -80,6 +97,11 @@ export default class VaultLibrarianPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = { ...this.settings, ...((await this.loadData()) as Partial<LibrarianSettings>) };
+    // promptVersion is a cache key for proposals.json, not a preference: it
+    // describes the prompt this build ships with. Taking it from disk would let
+    // a value stored by an older version keep outdated proposals alive, which is
+    // precisely what it exists to prevent.
+    this.settings.promptVersion = DEFAULT_SETTINGS.promptVersion;
   }
 
   async saveSettings(): Promise<void> {
@@ -158,8 +180,13 @@ export default class VaultLibrarianPlugin extends Plugin {
     }
   }
 
+  /**
+   * Writes the vocabulary as it stands. Deliberately *not* tidied here: a facet
+   * the user has just added has no values yet, and tidying drops empty facets,
+   * which made "Add facet" look like a dead button. Tidying is an explicit
+   * action (the "Tidy" button).
+   */
   async saveVocabulary(): Promise<void> {
-    this.vocabulary = tidyVocabulary(this.vocabulary);
     await writeFileSafe(
       this.app,
       `${this.settings.dataFolder}/${VOCABULARY_FILE}`,
@@ -210,7 +237,72 @@ export default class VaultLibrarianPlugin extends Plugin {
     new VocabularyModal(this.app, this).open();
   }
 
+  openSelectNotes(): void {
+    new SelectNotesModal(this.app, this).open();
+  }
+
+  /**
+   * Proposes tags for exactly the notes the picker returned.
+   *
+   * Deliberately the same code path as a normal run (`forcePaths`), so the two
+   * cannot drift: the picker only decides *which* notes, never how they are
+   * asked about. The batch cap is skipped for a hand-picked list — see
+   * `proposeForEntries`.
+   *
+   * `allowDecided` comes straight from the picker's override toggle and is
+   * forwarded untouched: this class never decides on its own to replace a
+   * decision the user already took.
+   */
+  async proposeSelected(paths: string[], allowDecided = false): Promise<void> {
+    if (paths.length === 0) return;
+    await this.loadVocabularyFile();
+    const apiKey = await this.getApiKey();
+    if (!apiKey) {
+      new Notice('Vault Librarian: no API key configured (Settings → Vault Librarian).');
+      return;
+    }
+    if (this.vocabulary.facets.length === 0) {
+      new Notice('Vault Librarian: define the tag vocabulary first.');
+      this.openVocabulary();
+      return;
+    }
+    const { catalog } = await this.scan();
+    const known = new Set(catalog.entries.map(e => e.path));
+    const selection = paths.filter(path => known.has(path));
+    if (selection.length === 0) {
+      new Notice('Vault Librarian: none of the selected notes is in the catalogue any more.');
+      return;
+    }
+    const modal = new ProgressModal(this.app, 'Propose tags (selection)');
+    modal.open();
+    try {
+      const { summary } = await proposeForEntries(
+        this.app,
+        this.settings,
+        apiKey,
+        catalog.entries,
+        this.vocabulary,
+        { forcePaths: selection, allowDecided },
+        (done, total, label) => modal.update(done, total, label),
+        () => modal.cancelled,
+      );
+      modal.close();
+      new Notice(
+        `Vault Librarian: ${summary.processed} of ${selection.length} selected note(s) proposed, ` +
+          `${summary.failed} failed. ${summary.pending} pending review.`,
+      );
+    } catch (e) {
+      modal.close();
+      new Notice(`Vault Librarian: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   async runPropose(): Promise<void> {
+    // Re-read from disk first. The in-memory copy is only loaded at plugin
+    // startup, so a vocabulary file created or edited while Obsidian was
+    // running would be ignored — and the guard below would refuse to propose
+    // against a vocabulary that is in fact on disk.
+    await this.loadVocabularyFile();
     const apiKey = await this.getApiKey();
     if (!apiKey) {
       new Notice('Vault Librarian: no API key configured (Settings → Vault Librarian).');
@@ -231,18 +323,85 @@ export default class VaultLibrarianPlugin extends Plugin {
         apiKey,
         catalog.entries,
         this.vocabulary,
+        {},
         (done, total, label) => modal.update(done, total, label),
         () => modal.cancelled,
       );
       modal.close();
       new Notice(
         `Vault Librarian: ${summary.processed} proposed, ${summary.skipped} left for later, ` +
-          `${summary.failed} failed. ${summary.pending} pending review.`,
+          `${summary.failed} failed.${summary.flagged > 0 ? ` ${summary.flagged} flagged as out of date.` : ''} ` +
+          `${summary.pending} pending review.`,
       );
     } catch (e) {
       modal.close();
       new Notice(`Vault Librarian: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  /**
+   * Asks the model again about ONE note, ignoring the up-to-date cache.
+   *
+   * Returns the fresh proposals file so the review panel can re-render from it,
+   * or null when it refused — and in that case it says why, because a silent
+   * refusal is indistinguishable from the model refusing to help.
+   */
+  async reproposeNote(path: string): Promise<ProposalsFile | null> {
+    await this.loadVocabularyFile();
+    const apiKey = await this.getApiKey();
+    if (!apiKey) {
+      new Notice('Vault Librarian: no API key configured (Settings → Vault Librarian).');
+      return null;
+    }
+    if (this.vocabulary.facets.length === 0) {
+      new Notice('Vault Librarian: define the tag vocabulary first.');
+      this.openVocabulary();
+      return null;
+    }
+
+    const current = await loadProposals(this.app, this.settings);
+    const existing = current.proposals.find(p => p.path === path);
+    if (existing && (existing.status === 'accepted' || existing.status === 'applied')) {
+      new Notice(
+        `Vault Librarian: ${path} is already ${existing.status} — reject it first if you want it asked again.`,
+      );
+      return null;
+    }
+
+    // A full scan, for two reasons: it refreshes the note's mtime (which is what
+    // the normal run compares against) and it supplies the vault's titles, which
+    // the "related" suggestions need.
+    const { catalog } = await this.scan();
+    if (!catalog.entries.some(e => e.path === path)) {
+      new Notice(
+        `Vault Librarian: ${path} is not in the catalogue — is it excluded, or inside an ignored folder?`,
+      );
+      return null;
+    }
+
+    const { file, summary } = await proposeForEntries(
+      this.app,
+      this.settings,
+      apiKey,
+      catalog.entries,
+      this.vocabulary,
+      { forcePaths: [path] },
+    );
+    new Notice(
+      summary.processed > 0
+        ? `Vault Librarian: re-proposed ${path}. ${summary.pending} pending review.`
+        : `Vault Librarian: nothing came back for ${path} (${summary.failed} failed) — check the key and the model.`,
+    );
+    return file;
+  }
+
+  async reproposeCurrentNote(): Promise<void> {
+    const active = this.app.workspace.getActiveFile();
+    if (!active) {
+      new Notice('Vault Librarian: no note is open.');
+      return;
+    }
+    await this.reproposeNote(active.path);
   }
 
   openReview(): void {

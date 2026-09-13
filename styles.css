@@ -35,3 +35,106 @@
   font-size: 0.85em;
   opacity: 0.75;
 }
+
+/*
+ * The picker is the one screen where "can I click this?" has to be answerable at
+ * a glance, and it was not: every row was built from the same three elements and
+ * nothing distinguished the two kinds. These are the rules the README had been
+ * promising ("shown greyed out with the reason") before they existed.
+ */
+/*
+ * Three aligned columns: the note (which alone changes width), the reason, and
+ * the state chip. The reason used to be a whole sentence, so every row ended up
+ * a different length and nothing lined up; it is now a couple of words, right
+ * aligned, with the chip on a fixed column at the end.
+ */
+.vl-pick-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5em;
+  padding: 0.15em 0 0.15em 0.5em;
+  border-left: 3px solid transparent;
+}
+
+.vl-pick-row > label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.vl-pick-row--todo {
+  border-left-color: var(--interactive-accent);
+}
+
+.vl-pick-row--done {
+  opacity: 0.5;
+}
+
+.vl-pick-row--done label {
+  cursor: not-allowed;
+}
+
+.vl-pick-path {
+  overflow-wrap: anywhere;
+}
+
+.vl-pick-note {
+  flex: 0 0 auto;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The state of a row, as a chip. Shared by the picker and the review panel. */
+.vl-state-chip {
+  display: inline-block;
+  flex: 0 0 auto;
+  /* A fixed column, so the chips line up whatever the path length is. */
+  min-width: 6.5em;
+  padding: 0 0.45em;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  font-size: 0.72em;
+  line-height: 1.7;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.vl-state-new,
+.vl-state-pending {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+
+.vl-state-out-of-date,
+.vl-state-rejected {
+  border-color: var(--text-warning);
+  color: var(--text-warning);
+}
+
+.vl-state-accepted,
+.vl-state-applied {
+  color: var(--text-muted);
+}
+
+.vl-decided-section {
+  margin: 0.75em 0;
+}
+
+.vl-decided-section > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.vl-review-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5em;
+}
+
+.vl-review-path {
+  word-break: break-all;
+}
+
+.vl-review-decided {
+  margin: 0.5em 0;
+}

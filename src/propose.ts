@@ -1,5 +1,5 @@
 import { App } from 'obsidian';
-import type { LibrarianSettings } from './settings';
+import { DEFAULT_SETTINGS, type LibrarianSettings } from './settings';
 import type { CatalogEntry } from './analysis';
 import {
   normalizeTag,
@@ -10,27 +10,20 @@ import {
 } from './vocabulary';
 import { askLlm } from './llm';
 import { readText, writeFileSafe } from './vault-io';
+import {
+  TAG_SUPPORT_RULES,
+  TAG_TASK_LINE,
+  isNoteChanged,
+  shouldPropose,
+  vocabularySuggestionPrompt,
+  withoutSelf,
+  type Proposal,
+  type ProposalsFile,
+} from './proposals';
 
-export type ProposalStatus = 'pending' | 'accepted' | 'rejected' | 'applied';
-
-export interface Proposal {
-  path: string;
-  /** Note mtime when the proposal was generated (cache key). */
-  mtime: number;
-  summary: string;
-  tags: string[];
-  related: string[];
-  /** Tags suggested by the model that the vocabulary does not know. */
-  unknown: string[];
-  status: ProposalStatus;
-}
-
-export interface ProposalsFile {
-  model: string;
-  promptVersion: string;
-  updatedAt: string;
-  proposals: Proposal[];
-}
+// The queue's shape and the rule that decides which note a run visits live in a
+// pure module; re-exported here so every existing importer keeps working.
+export type { Proposal, ProposalStatus, ProposalsFile } from './proposals';
 
 export const PROPOSALS_FILE = 'proposals.json';
 
@@ -84,21 +77,7 @@ export async function suggestVocabulary(
   apiKey: string,
   tags: Array<{ tag: string; count: number }>,
 ): Promise<Vocabulary> {
-  const listing = tags.slice(0, 400).map(t => `${t.tag} (${t.count})`).join('\n');
-  const prompt = [
-    `PROMPT_VERSION: v1`,
-    `These are all the tags currently used in a personal Obsidian vault, with how many notes use each one.`,
-    `Group them into at most 8 facets (for example: proyecto, tipo, estado, materia, tema).`,
-    `Rules:`,
-    `- Use short lowercase names, no accents and no slashes.`,
-    `- Merge obvious synonyms and near-duplicates into a single value.`,
-    `- Prefer the language of the tags (Spanish here if they are Spanish).`,
-    `- Do not invent tags that are not in the list.`,
-    `- Answer with ONLY JSON: {"facets":[{"name":"proyecto","values":["lisa","amawal"]}]}`,
-    ``,
-    `TAGS:`,
-    listing,
-  ].join('\n');
+  const prompt = vocabularySuggestionPrompt(tags, DEFAULT_SETTINGS.promptVersion);
 
   const answer = await askLlm(settings, apiKey, prompt, 'vocabulary');
   const cleaned = answer.replace(/```json/gi, '').replace(/```/g, '');
@@ -120,7 +99,15 @@ export interface ProposalResult {
   related: string[];
 }
 
-/** The versioned prompt. Bump settings.promptVersion when this changes. */
+/**
+ * The versioned prompt. Bump settings.promptVersion when this changes.
+ *
+ * The examples in the rules show the *shape* with stand-ins (`faceta/valor`),
+ * never a real tag. A weak model copies the example, and a real tag copied by
+ * mistake is valid — so it passes validation and gets written to the note. A
+ * stand-in that gets copied fails the vocabulary lookup instead and is shown in
+ * red, which is the safe way to be wrong.
+ */
 export function proposalPrompt(
   entry: CatalogEntry,
   vocabulary: Vocabulary,
@@ -131,22 +118,30 @@ export function proposalPrompt(
   const body = maxChars > 0 && noteText.length > maxChars ? `${noteText.slice(0, maxChars)}\n…[truncated]` : noteText;
   const titles = vaultTitles.slice(0, 600).join(' | ');
   return [
-    `PROMPT_VERSION: v1`,
-    `You are cataloguing a personal Obsidian vault. Work on ONE note.`,
+    `PROMPT_VERSION: ${DEFAULT_SETTINGS.promptVersion}`,
+    // "Obsidian" used to be here, and it was a leak: the word appeared in the
+    // instructions *and* `tema/obsidian` sat in the vocabulary, so two different
+    // models tagged unclassifiable notes (a list of streaming links, a note
+    // written entirely in Tifinagh) with it. An instruction is content too.
+    `You are cataloguing a personal markdown vault. Work on ONE note.`,
     ``,
     `VOCABULARY (use ONLY these tags, exact form facet/value):`,
     vocabularyPrompt(vocabulary),
     ``,
     `TASKS`,
     `1. "summary": one sentence in the note's own language (max 140 characters).`,
-    `2. "tags": between 3 and 6 tags chosen only from the vocabulary above.`,
+    TAG_TASK_LINE,
     `3. "related": up to 5 titles of existing notes clearly related to this one (titles only, no brackets). Empty list if none.`,
     ``,
     `RULES`,
     `- Never invent a tag outside the vocabulary; if nothing fits, return fewer tags.`,
+    ...TAG_SUPPORT_RULES,
     `- Do not repeat the note's title as a tag value.`,
+    `- The separator is a slash: "faceta/valor", never "faceta: valor" nor a list bullet.`,
+    `- Text in parentheses after a tag describes what that tag means. It is never`,
+    `  part of the tag: pick the tag, leave the description out.`,
     `- Answer with ONLY a JSON object, no prose and no code fences.`,
-    `- Shape: {"summary": "...", "tags": ["..."], "related": ["..."]}`,
+    `- Shape: {"summary": "...", "tags": ["faceta/valor", "otra-faceta/valor"], "related": ["titulo"]}`,
     ``,
     `VAULT TITLES (for "related"):`,
     titles,
@@ -185,6 +180,22 @@ export interface ProposeSummary {
   skipped: number;
   failed: number;
   pending: number;
+  /** Pending proposals the run marked as out of date instead of replacing. */
+  flagged: number;
+}
+
+export interface ProposeOptions {
+  /**
+   * Re-ask only these notes, ignoring the up-to-date check ("Re-propose this
+   * note"). Empty or absent is the normal run, which honours the cache.
+   */
+  forcePaths?: string[];
+  /**
+   * Lets a hand-picked run also replace a proposal that is already `accepted`
+   * or `applied`. Off by default, and only meaningful together with
+   * `forcePaths`: a batch run must never quietly overwrite a decision.
+   */
+  allowDecided?: boolean;
 }
 
 /**
@@ -197,22 +208,53 @@ export async function proposeForEntries(
   apiKey: string,
   entries: CatalogEntry[],
   vocabulary: Vocabulary,
+  options: ProposeOptions = {},
   onProgress?: (done: number, total: number, label: string) => void,
   isCancelled?: () => boolean,
 ): Promise<{ file: ProposalsFile; summary: ProposeSummary }> {
   const file = await loadProposals(app, settings);
+  // The file records the prompt version and the model that produced it. When
+  // either changes, the cached proposals answer a question nobody is asking any
+  // more, so they are re-generated instead of blocking those notes for ever:
+  // a pending proposal is only ever revisited when its note changes.
+  const stale =
+    file.promptVersion !== settings.promptVersion || file.model !== settings.model;
   file.model = settings.model;
   const byPath = new Map(file.proposals.map(p => [p.path, p]));
   const vaultTitles = entries.map(e => e.title);
 
-  const todo = entries.filter(entry => {
+  // Mark — never silently re-ask — the pending proposals whose note changed.
+  // The flag is what the review panel reads; re-asking here would replace the
+  // proposal and lose any edit made in that panel. Cheap to run every time, and
+  // it is the only thing that keeps the flag honest (a note that was edited
+  // again goes back to normal once it is re-proposed).
+  let flagged = 0;
+  for (const entry of entries) {
     const existing = byPath.get(entry.path);
-    if (!existing) return true;
-    if (existing.status === 'rejected' || existing.status === 'applied') return false;
-    return existing.mtime !== entry.mtime; // re-propose only when the note changed
+    if (!existing) continue;
+    const changed = isNoteChanged(existing, entry);
+    if (changed === Boolean(existing.noteChanged)) continue;
+    existing.noteChanged = changed;
+    flagged++;
+  }
+  if (flagged > 0) await saveProposals(app, settings, file);
+
+  const forced = new Set(options.forcePaths ?? []);
+  const todo = entries.filter(entry => {
+    if (forced.size > 0 && !forced.has(entry.path)) return false;
+    return shouldPropose(
+      byPath.get(entry.path),
+      stale,
+      forced.has(entry.path),
+      options.allowDecided ?? false,
+    );
   });
 
-  const total = Math.min(todo.length, Math.max(1, settings.maxNotesPerRun));
+  // A hand-picked selection is the whole batch: the cap is for the "leave it
+  // running" case, and honouring it here would silently drop notes the user
+  // ticked one by one.
+  const cap = forced.size > 0 ? todo.length : Math.max(1, settings.maxNotesPerRun);
+  const total = Math.min(todo.length, cap);
   let processed = 0;
   let skipped = todo.length - total;
   let failed = 0;
@@ -244,7 +286,7 @@ export async function proposeForEntries(
         mtime: entry.mtime,
         summary: parsed.summary,
         tags: valid,
-        related: parsed.related,
+        related: withoutSelf(parsed.related, entry.title),
         unknown,
         status: 'pending',
       };
@@ -270,6 +312,7 @@ export async function proposeForEntries(
       skipped,
       failed,
       pending: file.proposals.filter(p => p.status === 'pending').length,
+      flagged,
     },
   };
 }

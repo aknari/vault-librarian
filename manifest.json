@@ -1,7 +1,7 @@
 {
   "id": "vault-librarian",
   "name": "Vault Librarian",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "minAppVersion": "1.11.4",
   "description": "Audit, tag and cross-link a vault: a machine-readable catalogue, an editable tag vocabulary and a review queue for LLM proposals.",
   "author": "T. Bautista",
