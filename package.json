@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --external:obsidian --format=cjs --platform=browser --target=es2020 --outfile=../../.obsidian/plugins/vault-librarian/main.js",
+    "build": "esbuild src/main.ts --bundle --external:obsidian --format=cjs --platform=browser --target=es2020 --outfile=../../.obsidian/plugins/vault-librarian/main.js && cp styles.css ../../.obsidian/plugins/vault-librarian/styles.css",
     "typecheck": "tsc --noEmit",
     "test": "esbuild test/core.test.ts --bundle --platform=node --format=cjs --outfile=.test/core.test.cjs && esbuild test/models.test.ts --bundle --platform=node --format=cjs --outfile=.test/models.test.cjs && esbuild test/secrets.test.ts --bundle --platform=node --format=cjs --outfile=.test/secrets.test.cjs && node .test/secrets.test.cjs && node .test/core.test.cjs && node .test/models.test.cjs"
   },

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11T14:56
-updated: 2026-09-13T13:07
+updated: 2026-09-17T11:30
 ---
 # Vault Librarian
 
@@ -293,7 +293,7 @@ Every note means one request, so a *Propose* run over a large vault takes time. 
 npm install
 npm run typecheck   # tsc --noEmit
 npm test            # pure-core tests (markdown, vocabulary, catalogue)
-npm run build       # bundles src/main.ts into .obsidian/plugins/vault-librarian/main.js
+npm run build       # bundles src/main.ts into .obsidian/plugins/vault-librarian/, and copies styles.css with it
 ```
 
 The pure core (`markdown.ts`, `vocabulary.ts`, `analysis.ts`) has no Obsidian imports, so it is unit-tested in plain Node.
