@@ -9,7 +9,15 @@ import {
   type Vocabulary,
 } from './vocabulary';
 import { askLlm } from './llm';
-import { readText, writeFileSafe } from './vault-io';
+import { folderTargets, readText, writeFileSafe } from './vault-io';
+import {
+  MOVE_REASON_TASK_LINE,
+  MOVE_RULES,
+  MOVE_TASK_LINE,
+  folderListBlock,
+  isInsideRoots,
+  resolveFolderAnswer,
+} from './relocation';
 import {
   TAG_SUPPORT_RULES,
   TAG_TASK_LINE,
@@ -31,8 +39,23 @@ export function emptyProposalsFile(settings: LibrarianSettings): ProposalsFile {
   return {
     model: settings.model,
     promptVersion: settings.promptVersion,
+    moveEnabled: settings.moveEnabled,
     updatedAt: new Date().toISOString(),
     proposals: [],
+  };
+}
+
+/**
+ * The fields the folder suggestion added, with a value for proposals written by
+ * an older version. Required on `Proposal`, so an old file is normalised once
+ * here instead of forcing `?? ''` on every reader.
+ */
+function normalizeProposal(proposal: Proposal): Proposal {
+  return {
+    ...proposal,
+    moveTo: typeof proposal.moveTo === 'string' ? proposal.moveTo : '',
+    moveReason: typeof proposal.moveReason === 'string' ? proposal.moveReason : '',
+    unknownFolder: typeof proposal.unknownFolder === 'string' ? proposal.unknownFolder : '',
   };
 }
 
@@ -48,8 +71,12 @@ export async function loadProposals(
         return {
           model: String(parsed.model ?? settings.model),
           promptVersion: String(parsed.promptVersion ?? settings.promptVersion),
+          // Absent reads as `false`, not as the current setting: a file written
+          // before the option existed holds no folder suggestions, so it must
+          // come out stale when the option is on.
+          moveEnabled: parsed.moveEnabled === true,
           updatedAt: String(parsed.updatedAt ?? new Date().toISOString()),
-          proposals: parsed.proposals,
+          proposals: parsed.proposals.map(normalizeProposal),
         };
       }
     } catch {
@@ -97,6 +124,10 @@ export interface ProposalResult {
   summary: string;
   tags: string[];
   related: string[];
+  /** Raw answer to task 4; `undefined` when the model was not asked. */
+  folder?: unknown;
+  /** Raw answer to task 5; `''` when there is none. */
+  folderReason: string;
 }
 
 /**
@@ -114,9 +145,12 @@ export function proposalPrompt(
   noteText: string,
   vaultTitles: string[],
   maxChars: number,
+  /** Folders a note may be moved to. Empty = the model is not asked about them. */
+  folders: string[] = [],
 ): string {
   const body = maxChars > 0 && noteText.length > maxChars ? `${noteText.slice(0, maxChars)}\n…[truncated]` : noteText;
   const titles = vaultTitles.slice(0, 600).join(' | ');
+  const askFolder = folders.length > 0;
   return [
     `PROMPT_VERSION: ${DEFAULT_SETTINGS.promptVersion}`,
     // "Obsidian" used to be here, and it was a leak: the word appeared in the
@@ -132,19 +166,22 @@ export function proposalPrompt(
     `1. "summary": one sentence in the note's own language (max 140 characters).`,
     TAG_TASK_LINE,
     `3. "related": up to 5 titles of existing notes clearly related to this one (titles only, no brackets). Empty list if none.`,
+    ...(askFolder ? [MOVE_TASK_LINE, MOVE_REASON_TASK_LINE] : []),
     ``,
     `RULES`,
     `- Never invent a tag outside the vocabulary; if nothing fits, return fewer tags.`,
     ...TAG_SUPPORT_RULES,
+    ...(askFolder ? MOVE_RULES : []),
     `- Do not repeat the note's title as a tag value.`,
     `- The separator is a slash: "faceta/valor", never "faceta: valor" nor a list bullet.`,
     `- Text in parentheses after a tag describes what that tag means. It is never`,
     `  part of the tag: pick the tag, leave the description out.`,
     `- Answer with ONLY a JSON object, no prose and no code fences.`,
-    `- Shape: {"summary": "...", "tags": ["faceta/valor", "otra-faceta/valor"], "related": ["titulo"]}`,
+    `- Shape: {"summary": "...", "tags": ["faceta/valor", "otra-faceta/valor"], "related": ["titulo"]${askFolder ? ', "folder": "...", "folder_reason": "..."' : ''}}`,
     ``,
     `VAULT TITLES (for "related"):`,
     titles,
+    ...(askFolder ? [``, folderListBlock(folders)] : []),
     ``,
     `NOTE (${entry.path}):`,
     body,
@@ -169,6 +206,10 @@ export function parseProposalResponse(text: string): ProposalResult | null {
       summary,
       tags: toList(parsed.tags).map(normalizeTag).filter(Boolean),
       related: toList(parsed.related).map(r => r.replace(/^\[\[|\]\]$/g, '').trim()).filter(Boolean),
+      // Left as the model wrote it: turning it into a real destination is
+      // `resolveFolderAnswer`, which is the part worth testing without Obsidian.
+      folder: parsed.folder,
+      folderReason: typeof parsed.folder_reason === 'string' ? parsed.folder_reason.trim() : '',
     };
   } catch {
     return null;
@@ -213,13 +254,23 @@ export async function proposeForEntries(
   isCancelled?: () => boolean,
 ): Promise<{ file: ProposalsFile; summary: ProposeSummary }> {
   const file = await loadProposals(app, settings);
-  // The file records the prompt version and the model that produced it. When
-  // either changes, the cached proposals answer a question nobody is asking any
-  // more, so they are re-generated instead of blocking those notes for ever:
-  // a pending proposal is only ever revisited when its note changes.
+  // The folders the model may choose from, read once per run. Empty when the
+  // option is off, which is also what keeps tasks 4 and 5 out of the prompt.
+  const folders = settings.moveEnabled ? folderTargets(app, settings) : [];
+  // The file records the prompt version, the model that produced it and whether
+  // folders were asked about. When any of them changes, the cached proposals
+  // answer a question nobody is asking any more, so they are re-generated
+  // instead of blocking those notes for ever: a pending proposal is only ever
+  // revisited when its note changes.
   const stale =
-    file.promptVersion !== settings.promptVersion || file.model !== settings.model;
+    file.promptVersion !== settings.promptVersion ||
+    file.model !== settings.model ||
+    file.moveEnabled !== settings.moveEnabled;
   file.model = settings.model;
+  // Recorded before the run works rather than after: an interrupted run must
+  // not leave the queue claiming it was asked about folders when it was not.
+  const moveFlagChanged = file.moveEnabled !== settings.moveEnabled;
+  file.moveEnabled = settings.moveEnabled;
   const byPath = new Map(file.proposals.map(p => [p.path, p]));
   const vaultTitles = entries.map(e => e.title);
 
@@ -237,7 +288,7 @@ export async function proposeForEntries(
     existing.noteChanged = changed;
     flagged++;
   }
-  if (flagged > 0) await saveProposals(app, settings, file);
+  if (flagged > 0 || moveFlagChanged) await saveProposals(app, settings, file);
 
   const forced = new Set(options.forcePaths ?? []);
   const todo = entries.filter(entry => {
@@ -269,10 +320,25 @@ export async function proposeForEntries(
       continue;
     }
     try {
+      // The folder question is asked only about the notes that live in the notes
+      // folders. A note parked in the archive or in the wiki is not "misplaced":
+      // asking about it is how you get a wiki page suggested into 00-src. The
+      // destinations are a separate list, so an inbox can be a source of notes
+      // without being somewhere a note is filed into.
+      const askFolders =
+        folders.length > 0 &&
+        (settings.noteFolders.length === 0 || isInsideRoots(entry.path, settings.noteFolders));
       const answer = await askLlm(
         settings,
         apiKey,
-        proposalPrompt(entry, vocabulary, noteText, vaultTitles, settings.maxContextChars),
+        proposalPrompt(
+          entry,
+          vocabulary,
+          noteText,
+          vaultTitles,
+          settings.maxContextChars,
+          askFolders ? folders : [],
+        ),
         'proposal',
       );
       const parsed = parseProposalResponse(answer);
@@ -281,6 +347,7 @@ export async function proposeForEntries(
         continue;
       }
       const { valid, unknown } = validateTags(vocabulary, parsed.tags);
+      const folder = resolveFolderAnswer(entry.path, askFolders ? folders : [], parsed.folder);
       const proposal: Proposal = {
         path: entry.path,
         mtime: entry.mtime,
@@ -288,6 +355,11 @@ export async function proposeForEntries(
         tags: valid,
         related: withoutSelf(parsed.related, entry.title),
         unknown,
+        moveTo: folder.moveTo,
+        // Only kept next to a move it explains: a reason with nothing to move to
+        // is the model narrating a decision it did not take.
+        moveReason: folder.moveTo ? parsed.folderReason.slice(0, 240) : '',
+        unknownFolder: folder.unknownFolder,
         status: 'pending',
       };
       const idx = file.proposals.findIndex(p => p.path === entry.path);

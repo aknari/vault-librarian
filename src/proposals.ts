@@ -86,6 +86,23 @@ export interface Proposal {
   related: string[];
   /** Tags suggested by the model that the vocabulary does not know. */
   unknown: string[];
+  /**
+   * Folder this note belongs in, `''` when it stays where it is.
+   *
+   * Only a folder that exists in the vault survives validation, so a value here
+   * is always a path the plugin can actually move the note to — the move itself
+   * is the one action here that touches more than one file, because Obsidian
+   * rewrites every link pointing at the note.
+   */
+  moveTo: string;
+  /** Why, in the note's own language. `''` when there is no move. */
+  moveReason: string;
+  /**
+   * Folder the model named that the vault does not have, `''` when it named
+   * none. Kept visible for the same reason unknown tags are: dropping it
+   * silently hides the one thing worth knowing.
+   */
+  unknownFolder: string;
   status: ProposalStatus;
   /**
    * The note changed after this proposal was written, so it may be out of date.
@@ -102,6 +119,12 @@ export interface ProposalsFile {
   model: string;
   /** Prompt that produced these proposals; drives the `stale` flag below. */
   promptVersion: string;
+  /**
+   * Whether folder suggestions were asked for when this file was written. Part
+   * of the cache key, like the prompt and the model: turning the option on has
+   * to re-ask, or the queue would say "nothing to move" for ever.
+   */
+  moveEnabled: boolean;
   updatedAt: string;
   proposals: Proposal[];
 }

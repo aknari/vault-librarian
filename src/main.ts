@@ -11,7 +11,7 @@ import {
   type ProposalsFile,
 } from './propose';
 import { applyAccepted, generateMocs, undoLastApply } from './apply';
-import { readText, writeFileSafe } from './vault-io';
+import { folderTargets, readText, selectableFolders, writeFileSafe } from './vault-io';
 import { LibrarianSettingsTab } from './ui/settings-tab';
 import { ProgressModal } from './ui/progress';
 import { ReviewModal } from './ui/review-modal';
@@ -217,6 +217,22 @@ export default class VaultLibrarianPlugin extends Plugin {
     await saveProposals(this.app, this.settings, file);
   }
 
+  /**
+   * Folders a note may be moved to. Read per dialog rather than cached, so a
+   * folder created in Obsidian shows up in the review panel right away.
+   */
+  getFolderTargets(): string[] {
+    return folderTargets(this.app, this.settings);
+  }
+
+  /**
+   * Every folder the settings may name, for the folder pickers. Unfiltered by
+   * the current selection on purpose: through it, a root could never be added.
+   */
+  getSelectableFolders(): string[] {
+    return selectableFolders(this.app, this.settings);
+  }
+
   // ------------------------------------------------------------------- scans
 
   private async scan(): Promise<{ catalog: Catalog; stats: CatalogStats }> {
@@ -415,20 +431,33 @@ export default class VaultLibrarianPlugin extends Plugin {
       new Notice('Vault Librarian: no accepted proposals to apply.');
       return;
     }
-    const { applied, backupPath } = await applyAccepted(this.app, this.settings, file);
+    const { applied, moved, blocked, backupPath } = await applyAccepted(this.app, this.settings, file);
+    const what = [`${applied} note(s) updated`];
+    if (moved.length > 0) what.push(`${moved.length} moved`);
+    if (blocked.length > 0) {
+      what.push(`${blocked.length} left in place (a file with that name is already there)`);
+    }
     new Notice(
-      backupPath
-        ? `Vault Librarian: ${applied} note(s) updated. Backup: ${backupPath}`
-        : `Vault Librarian: ${applied} note(s) updated (no backup needed).`,
+      `Vault Librarian: ${what.join(', ')}. ` +
+        (backupPath ? `Backup: ${backupPath}` : 'No backup was needed.'),
     );
   }
 
   async runUndo(): Promise<void> {
-    const { restored, backupPath } = await undoLastApply(this.app, this.settings);
+    const { restored, blocked, backupPath } = await undoLastApply(this.app, this.settings);
+    if (restored === 0) {
+      new Notice(
+        blocked > 0
+          ? `Vault Librarian: nothing restored — ${blocked} note(s) of that backup are not where it left them.`
+          : 'Vault Librarian: no backup found to restore.',
+      );
+      return;
+    }
     new Notice(
-      restored > 0
-        ? `Vault Librarian: ${restored} note(s) restored from ${backupPath}.`
-        : 'Vault Librarian: no backup found to restore.',
+      `Vault Librarian: ${restored} note(s) restored from ${backupPath}.` +
+        (blocked > 0
+          ? ` ${blocked} moved note(s) were left as they are: the vault changed since that backup.`
+          : ''),
     );
   }
 

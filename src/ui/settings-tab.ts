@@ -3,7 +3,9 @@ import type VaultLibrarianPlugin from '../main';
 import { listModels } from '../llm';
 import { API_KEY_SECRET } from '../secrets';
 import { buildModelChoices, modelLabel } from '../models';
+import { effectiveRoots } from '../relocation';
 import type { Provider } from '../settings';
+import { FolderPickerModal } from './folder-picker';
 
 /** Sentinel in the model dropdown: ask for a name instead of picking one. */
 const CUSTOM_MODEL = '__custom__';
@@ -307,6 +309,71 @@ export class LibrarianSettingsTab extends PluginSettingTab {
         }),
       );
 
+    new Setting(containerEl).setName('Note folders').setHeading();
+    new Setting(containerEl)
+      .setName('Suggest a folder for each note')
+      .setDesc(
+        'The folder list goes into the prompt and the model may suggest a move; every proposal then ' +
+        'gets a folder dropdown, so you can also move a note the model left alone. Nothing moves ' +
+        'until the proposal is accepted and applied, and the move goes through Obsidian, which ' +
+        'rewrites the links that point at the note. Turning this on or off re-asks the pending ' +
+        'notes, because a cached proposal cannot answer about folders it was never asked about.',
+      )
+      .addToggle(toggle =>
+        toggle.setValue(s.moveEnabled).onChange(async value => {
+          s.moveEnabled = value;
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+      );
+
+    // Two lists, because they answer two different questions: where your notes
+    // live (which notes are worth asking about a folder) and where a note may go.
+    // An inbox is the case that separates them: full of your notes, and where
+    // things are picked up from, not filed into.
+    new Setting(containerEl)
+      .setName('Notes folders (where your notes live)')
+      .setDesc(
+        (s.noteFolders.length > 0
+          ? `Only notes inside these are asked which folder they belong in: ${s.noteFolders.join(', ')}.`
+          : 'No restriction: every scanned note is asked which folder it belongs in.') +
+          ' This does not change what the scan reads — that is still the excluded folders, above.',
+      )
+      .addButton(btn =>
+        btn.setButtonText('Choose folders…').onClick(() =>
+          this.openFolderPicker(
+            'noteFolders',
+            'Notes folders',
+            'Where your own notes live. A folder inside one of these is a place the model and the dropdown can move a note to, and its notes are the ones asked where they belong.',
+          ),
+        ),
+      );
+
+    const destinations = effectiveRoots(s.noteFolders, s.moveFolders);
+    const offeredCount = this.plugin.getFolderTargets().length;
+    new Setting(containerEl)
+      .setName('Folders a note may be moved to')
+      .setDesc(
+        (s.moveFolders.length > 0
+          ? `Only these: ${s.moveFolders.join(', ')}.`
+          : s.noteFolders.length > 0
+            ? `Empty, so the notes folders are used: ${s.noteFolders.join(', ')}.`
+            : 'Empty, and no notes folders either, so every folder the scan does not exclude is offered.') +
+          (destinations.length > 0
+            ? ` ${offeredCount} folder(s) end up on the list the model sees.`
+            : '') +
+          ' Excluded folders and this plugin\'s own data folder are never offered.',
+      )
+      .addButton(btn =>
+        btn.setButtonText('Choose folders…').onClick(() =>
+          this.openFolderPicker(
+            'moveFolders',
+            'Folders a note may be moved to',
+            'The destinations a move is allowed to use. Leave it empty to follow the notes folders above.',
+          ),
+        ),
+      );
+
     new Setting(containerEl).setName('Actions').setHeading();
     const action = (name: string, desc: string, label: string, run: () => void | Promise<void>): void => {
       new Setting(containerEl)
@@ -394,6 +461,31 @@ export class LibrarianSettingsTab extends PluginSettingTab {
     action('Generate MOCs', 'Creates/updates one MOC per folder, preserving your own text.', 'Generate MOCs', () =>
       this.plugin.runMocs(),
     );
+  }
+
+  /**
+   * Opens the checkbox picker for one of the two folder lists.
+   *
+   * The list is drawn from the vault, so a saved value is always a folder that
+   * exists — which is also why this is a modal and not a text box.
+   */
+  private openFolderPicker(
+    key: 'noteFolders' | 'moveFolders',
+    title: string,
+    hint: string,
+  ): void {
+    new FolderPickerModal(this.app, {
+      title,
+      hint,
+      folders: this.plugin.getSelectableFolders(),
+      selected: this.plugin.settings[key],
+      onSave: async folders => {
+        this.plugin.settings[key] = folders;
+        await this.plugin.saveSettings();
+        // The summary lines under both rows depend on these lists.
+        this.display();
+      },
+    }).open();
   }
 
   /**

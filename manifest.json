@@ -1,9 +1,9 @@
 {
   "id": "vault-librarian",
   "name": "Vault Librarian",
-  "version": "0.1.5",
+  "version": "0.3.0",
   "minAppVersion": "1.11.4",
-  "description": "Audit, tag and cross-link a vault: a machine-readable catalogue, an editable tag vocabulary and a review queue for LLM proposals.",
+  "description": "Audit, tag, cross-link and re-file a vault: a machine-readable catalogue, an editable tag vocabulary and a review queue for LLM proposals.",
   "author": "T. Bautista",
   "authorUrl": "https://github.com/aknari",
   "isDesktopOnly": false

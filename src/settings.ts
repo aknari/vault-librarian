@@ -49,6 +49,22 @@ export interface LibrarianSettings {
   /** Characters of each note sent to the model (0 = whole note). */
   maxContextChars: number;
 
+  /**
+   * Ask the model which folder each note belongs in, so a misplaced note can be
+   * moved from the review panel. Off means the prompt never mentions folders.
+   */
+  moveEnabled: boolean;
+  /**
+   * Where your own notes live: only notes inside these folders are asked which
+   * folder they belong in. Empty = every scanned note is asked.
+   */
+  noteFolders: string[];
+  /**
+   * Folders a note may be moved to. Empty = the notes folders above; and if
+   * those are empty too, every folder the scan does not exclude.
+   */
+  moveFolders: string[];
+
   /** Generate one MOC note per folder with 2+ notes. */
   mocEnabled: boolean;
   /** File name (without .md) used for MOC notes. */
@@ -81,11 +97,18 @@ export const DEFAULT_SETTINGS: Readonly<LibrarianSettings> = Object.freeze({
   maxNotesPerRun: 25,
   maxContextChars: 4000,
 
+  moveEnabled: true,
+  // Empty on purpose, and not a guess at somebody's layout: with no restriction
+  // the feature behaves as it did before these settings existed.
+  noteFolders: [],
+  moveFolders: [],
   mocEnabled: true,
   mocFileName: '_MOC',
   mocTag: 'moc',
   tagMode: 'merge',
   // v5: descriptions per facet and per value; "Obsidian" removed from the
   // framing line; no automatic renewal of a pending proposal whose note changed.
-  promptVersion: 'v5',
+  // v6: the folder suggestion ("folder" / "folder_reason") and the FOLDERS list
+  // it has to be copied from.
+  promptVersion: 'v6',
 });

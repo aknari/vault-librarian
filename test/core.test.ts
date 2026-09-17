@@ -49,6 +49,18 @@ import {
   normalizeForMatch,
   suggestMatch,
 } from '../src/similarity';
+import {
+  MOVE_RULES,
+  effectiveRoots,
+  folderAnswer,
+  folderListBlock,
+  isCandidateFolder,
+  isInsideRoots,
+  matchFolder,
+  normalizeFolderPath,
+  planMove,
+  resolveFolderAnswer,
+} from '../src/relocation';
 
 let passed = 0;
 let failed = 0;
@@ -293,6 +305,9 @@ function pendingProposal(mtime: number): Proposal {
     tags: [],
     related: [],
     unknown: [],
+    moveTo: '',
+    moveReason: '',
+    unknownFolder: '',
     status: 'pending',
   };
 }
@@ -714,6 +729,130 @@ check('catalog: a path-qualified link picks the right note of two with the same 
   const dos = linked.catalog.entries.find(e => e.path === '00-src/dos/01-materias.md');
   assert.equal(uno?.linksIn, 1, 'the named one is the one that gets the link');
   assert.equal(dos?.linksIn, 0);
+});
+
+// ------------------------------------------------------------ relocation
+
+check('relocation: the wrapping models add around a path is not part of it', () => {
+  // Every one of these makes a correct answer fail the match, which in a
+  // feature whose point is to be applied is a silent no-op.
+  assert.equal(normalizeFolderPath('  `00-src/30-dev/60-plasma 6`  '), '00-src/30-dev/60-plasma 6');
+  assert.equal(normalizeFolderPath('"00-src/30-dev/"'), '00-src/30-dev');
+  assert.equal(normalizeFolderPath('[01-inbox]'), '01-inbox');
+  assert.equal(normalizeFolderPath('./01-inbox'), '01-inbox');
+  assert.equal(normalizeFolderPath('00-src\\30-dev'), '00-src/30-dev');
+  // Not a destination: the root is where notes already are.
+  assert.equal(normalizeFolderPath('(root)'), '');
+  assert.equal(normalizeFolderPath('/'), '');
+  assert.equal(normalizeFolderPath('   '), '');
+});
+
+check('relocation: a folder the vault does not have is never a destination', () => {
+  // The note's own folder is in the list, as it is in a real run: every folder
+  // of the vault is, minus the excluded ones.
+  const targets = [
+    '00-src/30-dev',
+    '00-src/30-dev/60-plasma 6',
+    '00-src/30-dev/10-misc',
+    '01-inbox',
+  ];
+  const note = '00-src/30-dev/10-misc/20-internacionalización de plasmoids.md';
+
+  const moved = resolveFolderAnswer(note, targets, '00-src/30-dev/60-plasma 6');
+  assert.equal(moved.moveTo, '00-src/30-dev/60-plasma 6');
+  assert.equal(moved.unknownFolder, '', 'a folder that exists is not "unknown"');
+
+  // The near-miss is the case that matters: "plasma" is not "60-plasma 6".
+  const invented = resolveFolderAnswer(note, targets, '00-src/30-dev/plasma');
+  assert.equal(invented.moveTo, '', 'a folder that does not exist is not a destination');
+  assert.equal(invented.unknownFolder, '00-src/30-dev/plasma', 'and it is shown, not swallowed');
+
+  // A folder the vault has but the plugin will not move a note into lands in the
+  // same field: from here the two are the same thing (nowhere to go).
+  const refused = resolveFolderAnswer(note, targets, '85-archive');
+  assert.equal(refused.moveTo, '');
+  assert.equal(refused.unknownFolder, '85-archive');
+
+  // Answering with the note's own folder is the model saying "leave it there".
+  const stay = resolveFolderAnswer(note, targets, '00-src/30-dev/10-misc');
+  assert.equal(stay.moveTo, '');
+  assert.equal(stay.unknownFolder, '', 'the note being where it belongs is not a failure');
+
+  assert.deepEqual(resolveFolderAnswer(note, targets, undefined), { moveTo: '', unknownFolder: '' });
+  assert.deepEqual(resolveFolderAnswer(note, targets, ''), { moveTo: '', unknownFolder: '' });
+});
+
+check('relocation: a model that answers with a list or a quoted path still lands', () => {
+  assert.equal(folderAnswer(['01-inbox']), '01-inbox');
+  assert.equal(folderAnswer('`01-inbox`'), '01-inbox');
+  assert.equal(folderAnswer({ folder: '01-inbox' }), '', 'an object is not an answer');
+  assert.equal(folderAnswer(42), '');
+});
+
+check('relocation: two folders written in Tifinagh are not folded into one', () => {
+  // The tag matcher keeps only [a-z0-9] on purpose; used here it would turn both
+  // of these into the same empty string and match the wrong folder.
+  const targets = ['00-src/30-dev/50-ⵜⴰⵎⴰⵣⵉⴳⵖⵜ', '00-src/30-dev/80-test'];
+  assert.equal(matchFolder(targets, '00-src/30-dev/50-ⵜⴰⵎⴰⵣⵉⴳⵖⵜ'), '00-src/30-dev/50-ⵜⴰⵎⴰⵣⵉⴳⵖⵜ');
+  assert.equal(matchFolder(targets, 'ⵜⴰⵎⴰⵣⵉⴳⵖⵜ'), null, 'a bare name is not a path');
+  assert.equal(matchFolder(targets, '00-src/30-dev/50-ⵜⴰⵎⴰⵣⵉⴳⵖⵜ/'), '00-src/30-dev/50-ⵜⴰⵎⴰⵣⵉⴳⵖⵜ');
+});
+
+check('relocation: a move keeps the file name and refuses a no-op', () => {
+  const note = '00-src/30-dev/10-misc/20-internacionalización de plasmoids.md';
+  assert.deepEqual(planMove(note, '00-src/30-dev/60-plasma 6'), {
+    from: '00-src/30-dev/10-misc',
+    to: '00-src/30-dev/60-plasma 6/20-internacionalización de plasmoids.md',
+  });
+  // Same folder (case and a trailing slash aside) is not a move.
+  assert.equal(planMove(note, '00-src/30-dev/10-misc'), null);
+  assert.equal(planMove(note, '00-src/30-dev/10-Misc/'), null);
+  assert.equal(planMove(note, ''), null);
+  assert.equal(planMove('01-inbox/nota.md', '01-inbox'), null, 'the root of a vault is not a folder');
+  // A move to the vault root is spelled as the root, and the file keeps its name.
+  assert.deepEqual(planMove('01-inbox/nota.md', '.'), null);
+});
+
+check('relocation: hidden, excluded and the plugin\'s own folders are not destinations', () => {
+  const excluded = ['.obsidian', 'node_modules', '85-archive', '80-support/templates'];
+  const avoid = ['80-support/librarian'];
+  assert.equal(isCandidateFolder('01-inbox', excluded, avoid), true);
+  assert.equal(isCandidateFolder('00-src/30-dev/60-plasma 6', excluded, avoid), true);
+  assert.equal(isCandidateFolder('.obsidian/plugins', excluded, avoid), false);
+  assert.equal(isCandidateFolder('01-inbox/node_modules', excluded, avoid), false);
+  // An exclusion with a slash names a path and its subtree; a bare name matches
+  // any folder with that segment. Both forms are what the setting means.
+  assert.equal(isCandidateFolder('80-support/templates', excluded, avoid), false);
+  assert.equal(isCandidateFolder('80-support/templates/sub', excluded, avoid), false);
+  assert.equal(isCandidateFolder('80-support/librarian/backups', excluded, avoid), false);
+  assert.equal(isCandidateFolder('80-support/templates-otros', excluded, avoid), true);
+});
+
+check('relocation: a notes folder covers its subtree and nothing else', () => {
+  assert.equal(isInsideRoots('00-src/30-dev/30-lisa/nota.md', ['00-src']), true);
+  assert.equal(isInsideRoots('01-inbox/10-ideas.md', ['00-src', '01-inbox']), true);
+  // The separator is what keeps `00-src/30-dev` from covering its neighbours.
+  assert.equal(isInsideRoots('00-src/30-dev-otros/nota.md', ['00-src/30-dev']), false);
+  assert.equal(isInsideRoots('00-scr/nota.md', ['00-src']), false, 'a typo must not match');
+  assert.equal(isInsideRoots('20-wiki/03-plasma/x.md', ['00-src', '01-inbox']), false);
+  assert.equal(isInsideRoots('00-src/30-dev', ['00-src/30-dev']), true, 'the root itself counts');
+  assert.equal(isInsideRoots('nota.md', []), false, 'no roots, nothing is inside');
+});
+
+check('relocation: destinations follow their own list, and the notes folders if empty', () => {
+  // The inbox case: a source of notes that is not somewhere a note is filed into.
+  assert.deepEqual(effectiveRoots(['00-src', '01-inbox'], ['00-src']), ['00-src']);
+  assert.deepEqual(effectiveRoots(['00-src', '01-inbox'], []), ['00-src', '01-inbox']);
+  assert.deepEqual(effectiveRoots([], []), [], 'nothing set = no restriction at all');
+});
+
+check('relocation: the prompt spells the folders out and forbids inventing one', () => {
+  const block = folderListBlock(['00-src/30-dev', '01-inbox']);
+  assert.ok(block.includes('- 00-src/30-dev') && block.includes('- 01-inbox'));
+  assert.ok(/FOLDERS/.test(block));
+  // The list *is* the answer space: the model cannot copy a path it was not shown.
+  assert.ok(MOVE_RULES.some(rule => rule.includes('FOLDERS')));
+  assert.ok(MOVE_RULES.some(rule => /right answer far more often/.test(rule)));
 });
 
 console.log('');

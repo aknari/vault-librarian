@@ -1,6 +1,7 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
 import type VaultLibrarianPlugin from '../main';
 import type { Proposal, ProposalsFile } from '../propose';
+import { describeMove, planMove } from '../relocation';
 import { normalizeTag, validateTags } from '../vocabulary';
 
 const MAX_SHOWN = 60;
@@ -16,6 +17,13 @@ export class ReviewModal extends Modal {
    */
   private readonly openSections = new Set<string>();
 
+  /**
+   * Destinations the move dropdown offers, read once per open so a folder
+   * created while the panel was closed is not missing.
+   */
+  private folders: string[] = [];
+  private moveEnabled = false;
+
   constructor(
     app: App,
     private readonly plugin: VaultLibrarianPlugin,
@@ -28,6 +36,8 @@ export class ReviewModal extends Modal {
     // The tags shown here are validated against the vocabulary, so read it from
     // disk instead of trusting the copy loaded at startup.
     await this.plugin.loadVocabularyFile();
+    this.moveEnabled = this.plugin.settings.moveEnabled;
+    this.folders = this.moveEnabled ? this.plugin.getFolderTargets() : [];
     this.file = await this.plugin.getProposalsFile();
     this.render();
   }
@@ -50,11 +60,18 @@ export class ReviewModal extends Modal {
       file.proposals.filter(p => p.status === status).length;
 
     const outOfDate = file.proposals.filter(p => p.status === 'pending' && p.noteChanged).length;
+    // A move still to be made covers both cases: a pending suggestion nobody has
+    // applied yet, and one that *was* applied but was left in place because the
+    // destination was taken. Both are the same thing to the reader.
+    const moves = file.proposals.filter(
+      p => p.moveTo !== '' && planMove(p.path, p.moveTo) !== null,
+    ).length;
     contentEl.createEl('p', {
       text:
         `Pending: ${count('pending')} · accepted: ${count('accepted')} · applied: ${count('applied')} · ` +
         `rejected: ${count('rejected')} (of ${file.proposals.length}).` +
-        (outOfDate > 0 ? ` Out of date: ${outOfDate}.` : ''),
+        (outOfDate > 0 ? ` Out of date: ${outOfDate}.` : '') +
+        (moves > 0 ? ` Moves to make: ${moves}.` : ''),
     });
     contentEl.createEl('p', {
       text: 'Nothing is written to your notes until you press "Apply accepted".',
@@ -186,6 +203,18 @@ export class ReviewModal extends Modal {
             ? proposal.tags.join(', ')
             : 'no tags in this proposal — applying it would only write the summary',
       });
+      // An accepted proposal can carry a move, and this collapsed section is the
+      // last place to notice it before pressing Apply.
+      const willMove =
+        proposal.status === 'accepted' && proposal.moveTo !== ''
+          ? planMove(proposal.path, proposal.moveTo)
+          : null;
+      if (willMove) {
+        box.createEl('p', {
+          cls: 'vl-hint',
+          text: `Applying it will move the note: ${willMove.from || '(root)'} → ${willMove.to}`,
+        });
+      }
       if (proposal.status === 'applied') {
         box.createEl('p', {
           cls: 'vl-hint',
@@ -194,6 +223,16 @@ export class ReviewModal extends Modal {
             'proposal, it does not remove them. Use "Undo last apply" to restore the notes ' +
             'of the last apply, content included.',
         });
+        // The move is the one part of an applied proposal that can have been
+        // skipped, and the queue would otherwise say nothing about it.
+        if (proposal.moveTo !== '' && planMove(proposal.path, proposal.moveTo) !== null) {
+          box.createEl('p', {
+            cls: 'vl-hint',
+            text:
+              `The move to ${proposal.moveTo} was not made: something with that name is` +
+              ' already there. Move the note yourself, or edit the proposed folder and apply again.',
+          });
+        }
       }
 
       new Setting(box)
@@ -263,6 +302,8 @@ export class ReviewModal extends Modal {
       new Setting(box).setName('Related').setDesc(proposal.related.join(' · '));
     }
 
+    if (this.moveEnabled) this.renderMove(box, proposal);
+
     new Setting(box)
       .addButton(btn =>
         btn.setButtonText('Accept').setCta().onClick(async () => {
@@ -296,5 +337,74 @@ export class ReviewModal extends Modal {
           }
         });
       });
+  }
+
+  /**
+   * The move row: the folder the model suggests, and the dropdown to change it
+   * or drop the suggestion.
+   *
+   * Offered on every pending proposal, not only on the ones the model wanted to
+   * move: the row is also how a note gets moved by hand, with the link rewriting
+   * that only Obsidian's file manager does.
+   */
+  private renderMove(box: HTMLElement, proposal: Proposal): void {
+    const current = proposal.path.split('/').slice(0, -1).join('/');
+    const options = this.folders.filter(folder => folder !== current);
+    // What the model proposed, so that choosing a different folder can drop the
+    // reason: it explains a folder that is no longer the answer.
+    const suggested = proposal.moveTo;
+
+    const describe = (): string => {
+      if (proposal.moveTo !== '' && planMove(proposal.path, proposal.moveTo) === null) {
+        // The note was moved there by hand after the suggestion was made.
+        return 'The note is already in this folder. Choose another one, or leave it.';
+      }
+      if (proposal.moveTo !== '') {
+        return (
+          (proposal.moveReason !== '' ? `${proposal.moveReason} ` : 'Suggested by the model. ') +
+          'Accepting this moves the note, and Obsidian rewrites the links that point at it.'
+        );
+      }
+      if (proposal.unknownFolder !== '') {
+        // Says "cannot move it to" and not "does not exist": the folder may be
+        // real and simply excluded from the destinations.
+        return `The model suggested "${proposal.unknownFolder}", which is not a folder this plugin can move a note into. Pick one below, or leave it.`;
+      }
+      return 'Optional: pick a folder and "Apply accepted" moves the note there, rewriting the links that point at it.';
+    };
+
+    const setting = new Setting(box).setName('Move').setDesc(describe());
+    // Its own line, repainted in place: re-rendering the whole panel on every
+    // dropdown change would rebuild 30 cards to move one sentence.
+    const pathLine = box.createEl('p', { cls: 'vl-hint' });
+    const paint = (): void => {
+      pathLine.setText(
+        proposal.moveTo === '' ? '' : `→ ${describeMove(proposal.path, proposal.moveTo)}`,
+      );
+      setting.setDesc(describe());
+    };
+
+    setting.addDropdown(dd => {
+      dd.addOption('', '— keep where it is —');
+      for (const folder of options) dd.addOption(folder, folder);
+      // Two folders the plain list cannot offer, and both have to stay visible
+      // and droppable instead of silently reading as "keep where it is": one that
+      // was renamed or deleted since the proposal was written, and the note's own
+      // folder (the note was moved there by hand after the suggestion).
+      if (proposal.moveTo !== '' && !options.includes(proposal.moveTo)) {
+        const label = this.folders.includes(proposal.moveTo)
+          ? `${proposal.moveTo} (already here)`
+          : `${proposal.moveTo} (not found)`;
+        dd.addOption(proposal.moveTo, label);
+      }
+      dd.setValue(proposal.moveTo);
+      dd.onChange(value => {
+        proposal.moveTo = value;
+        if (value !== suggested) proposal.moveReason = '';
+        paint();
+      });
+    });
+
+    paint();
   }
 }

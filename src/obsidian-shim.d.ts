@@ -40,6 +40,16 @@ declare module "obsidian" {
     create(path: string, content: string): Promise<TFile>;
     createFolder(path: string): Promise<TFolder>;
     delete(file: TFile): Promise<void>;
+    /** Every loaded file and folder; the only way to enumerate folders. */
+    getAllLoadedFiles(): Array<TFile | TFolder>;
+  }
+
+  /**
+   * `vault.rename` moves a file; this one also rewrites the links that point at
+   * it, which is the whole reason a move goes through the file manager.
+   */
+  export class FileManager {
+    renameFile(file: TFile, newPath: string): Promise<void>;
   }
 
   export class Workspace {
@@ -49,6 +59,7 @@ declare module "obsidian" {
   export class App {
     vault: Vault;
     workspace: Workspace;
+    fileManager: FileManager;
     secretStorage?: SecretStorage;
   }
 

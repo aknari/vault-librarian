@@ -138,3 +138,22 @@
 .vl-review-decided {
   margin: 0.5em 0;
 }
+
+/* Scrollable checkbox list, one row per folder (the two folder settings). */
+.vl-folder-list {
+  max-height: 45vh;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 0 0.6em;
+  margin-bottom: 0.8em;
+}
+
+.vl-folder-row {
+  padding: 0.1em 0;
+}
+
+.vl-folder-row .setting-item-name {
+  word-break: break-all;
+  font-size: 0.9em;
+}

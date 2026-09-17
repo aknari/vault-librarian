@@ -56,7 +56,10 @@ In **Settings → Vault Librarian**:
 | API key | Stored in Obsidian's **secret storage** (your system keychain), shared with other plugins. It is never written to `data.json` nor to any file in the vault. |
 | Data folder | Where the catalogue, vocabulary, proposals and backups live. Default `80-support/librarian`. |
 | Report path | The note that receives the human-readable audit report. |
-| Excluded folders | Folder names skipped while scanning, matched at any depth. |
+| Excluded folders | Folder names skipped while scanning, matched at any depth. They are not offered as destinations when a note is moved, either. |
+| Suggest a folder for each note | Whether the model is asked which folder a note belongs in, and whether proposals carry a folder dropdown. |
+| Notes folders | Where your own notes live. Only notes inside are asked which folder they belong in. Empty = every scanned note. |
+| Folders a note may be moved to | The destinations a move may use. Empty = the notes folders; both empty = every folder the scan does not exclude. An inbox can be a source of notes without being a destination. |
 | Max notes per run | How many notes a single *Propose tags* run may send to the model. Each note is one request. |
 | Tag mode | `merge` keeps the tags already in a note's frontmatter and adds the accepted ones; `replace` sets exactly what you accepted. |
 | MOC options | Whether to generate one map-of-content note per folder, its file name, and the tag it gets. |
@@ -73,9 +76,11 @@ In **Settings → Vault Librarian**:
 3. **Propose tags** — with a small *Max notes per run* (3–5 is a good start). Proposals
    go to `proposals.json`; **your notes are still untouched**.
 4. **Review proposals** — accept, edit or reject each one. Tags outside the vocabulary
-   are flagged and are never applied silently.
-5. **Apply accepted** — writes `summary` and `tags` into the frontmatter, after taking a
-   backup. **Undo last apply** reverts the whole run.
+   are flagged and are never applied silently, and a suggested folder is refused unless
+   it exists in the vault.
+5. **Apply accepted** — writes `summary` and `tags` into the frontmatter, and moves the
+   notes whose folder was accepted, after taking a backup. **Undo last apply** reverts
+   the whole run, moving each note back where it was.
 6. **Generate MOCs** — one note per folder with two or more notes. This is the step that
    creates new files in your folders; it only rewrites the block between
    `<!-- librarian:moc:start -->` and `<!-- librarian:moc:end -->`, so your own text
@@ -88,10 +93,11 @@ In **Settings → Vault Librarian**:
 | `<data folder>/catalog.json` | The scan result: one entry per note. |
 | `<data folder>/vocabulary.json` | Facets and values. |
 | `<data folder>/proposals.json` | Proposals and their status (`pending`, `accepted`, `rejected`, `applied`). |
-| `<data folder>/backups/*.json` | Snapshot taken before each *Apply* run, used by *Undo last apply*. |
+| `<data folder>/backups/*.json` | Snapshot taken before each *Apply* run, used by *Undo last apply*, including where each moved note went. |
 | `<report path>` | The audit report (default `80-support/librarian/informe.md`). |
 | `<folder>/_MOC.md` | Generated maps of content, when MOC generation is enabled. |
 | Frontmatter of your notes | `summary` and `tags`, **only** after you press *Apply accepted*, and only for accepted proposals. Inline tags in the body of a note are never modified. |
+| Folder of your notes | Only for an accepted move, and only on *Apply accepted*. The note keeps its name; Obsidian rewrites the links that point at it. |
 
 ## Updating
 
