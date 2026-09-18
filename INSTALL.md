@@ -1,3 +1,7 @@
+---
+created: 2026-09-12T19:57
+updated: 2026-09-18T09:54
+---
 # Installing Vault Librarian
 
 This plugin is not in Obsidian's community plugin list. Install it manually, from a
@@ -34,12 +38,19 @@ cd vault-librarian
 npm install
 npm run typecheck
 npm test
-npm run build
+npm run build       # bundles into dist/
+npm run deploy      # build, then copy dist/ into a vault's plugin folder
 ```
 
-`npm run build` writes `main.js` straight into `.obsidian/plugins/vault-librarian/` of
-the repository's **parent** vault, so the build assumes the repo lives inside a vault
-(for example `<vault>/80-support/vault-librarian/`).
+`npm run build` writes into `dist/` and touches nothing else, so the build does not depend
+on where the repository sits. `npm run deploy` copies `dist/main.js`, `dist/styles.css` and
+`manifest.json` into a vault's plugin folder: the `../../.obsidian/plugins/vault-librarian/`
+of the vault the source lives in (`<vault>/80-support/vault-librarian/`), or, for a
+repository kept anywhere else, wherever `OBSIDIAN_PLUGIN_DIR` points:
+
+```bash
+OBSIDIAN_PLUGIN_DIR=~/my-vault/.obsidian/plugins/vault-librarian npm run deploy
+```
 
 ## Option 3 — BRAT (auto-updates)
 

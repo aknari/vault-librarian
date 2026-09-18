@@ -1,3 +1,7 @@
+---
+created: 2026-09-11T14:56
+updated: 2026-09-18T09:54
+---
 # Contributing
 
 Thanks for your interest in Vault Librarian.
@@ -17,11 +21,13 @@ npm install
 npm run typecheck
 npm test
 npm run build
+npm run deploy      # build, then copy dist/ into the vault's plugin folder
 ```
 
-`npm run build` writes `main.js` into `.obsidian/plugins/vault-librarian/` of the
-repository's parent vault, so a test vault works best with this repo inside
-`<vault>/80-support/`.
+`npm run build` writes into `dist/` and nothing outside it, so the repository can live
+anywhere. `npm run deploy` is the one that needs a vault: it copies `dist/` and
+`manifest.json` into `<vault>/.obsidian/plugins/vault-librarian/` of the vault this source
+lives in, or into `OBSIDIAN_PLUGIN_DIR` if you set it.
 
 ## Ground rules
 
